@@ -19,8 +19,9 @@ const uploadHost = "https://push.clients6.google.com/upload/"
 //
 // 匿名也能传成功，但传上去的文件在对话里引用会被回 1100，所以调用方要自己确保有 cookie。
 // proxyURL 必须跟正式请求同一出口，否则在 Google 眼里是两个会话共用文件。
-func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string, error) {
-	pushID, pctx, err := getUploadTokens(cookie, proxyURL)
+func uploadBytes(cookie, proxyURL string, data []byte, filename string, transports ...*browserTransport) (string, error) {
+	t := firstBrowserTransport(transports)
+	pushID, pctx, err := transportUploadTokens(t, cookie, proxyURL)
 	if err != nil {
 		return "", fmt.Errorf("取上传页面参数失败: %w", err)
 	}
@@ -63,7 +64,7 @@ func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string,
 		"X-Goog-Upload-Protocol":              "resumable",
 		"X-Goog-Upload-Header-Content-Length": strconv.Itoa(len(data)),
 	})
-	status, respHead, body, err := uploadPost(uploadHost, startHeaders,
+	status, respHead, body, err := transportUploadPost(t, uploadHost, startHeaders,
 		[]byte("File name: "+sanitizeUploadName(filename)), proxyURL)
 	if err != nil {
 		return "", fmt.Errorf("上传 start 失败: %w", err)
@@ -82,7 +83,7 @@ func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string,
 		"X-Goog-Upload-Command": "upload, finalize",
 		"X-Goog-Upload-Offset":  "0",
 	})
-	status, _, body, err = uploadPost(putURL, upHeaders, data, proxyURL)
+	status, _, body, err = transportUploadPost(t, putURL, upHeaders, data, proxyURL)
 	if err != nil {
 		return "", fmt.Errorf("上传 finalize 失败: %w", err)
 	}

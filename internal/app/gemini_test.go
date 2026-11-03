@@ -338,6 +338,15 @@ func TestCookieHealthView(t *testing.T) {
 // 每个都该拿到不同的号。没加锁时两个请求会 SELECT 到同一个"最久未用"的号、
 // 双双用它（跑 -race 更容易暴露）。
 func TestPickCookieConcurrentDistinct(t *testing.T) {
+	orig := rtCfg().AccountStrategy
+	rtMu.Lock()
+	rtVal.AccountStrategy = "round_robin"
+	rtMu.Unlock()
+	defer func() {
+		rtMu.Lock()
+		rtVal.AccountStrategy = orig
+		rtMu.Unlock()
+	}()
 	const n = 8
 	for i := 0; i < n; i++ {
 		id, err := accountAdd("conc", fmt.Sprintf("SAPISID=d%d; SID=x", i), "")

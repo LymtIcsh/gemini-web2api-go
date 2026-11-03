@@ -63,6 +63,9 @@ type RuntimeConfig struct {
 	// Firefox UA + 去 Sec-CH-UA）；关 → 用 Impersonate（默认 Chrome）。直连才是完整 Firefox
 	// 指纹，走代理时 TLS 仍是 Go 标准库的。默认 false。见 isFirefoxProfile / effectiveImpersonate。
 	FirefoxFingerprint bool `json:"firefox_fingerprint"`
+	// AccountStrategy 控制账号池策略："sticky"（默认，粘性单号优先，单号额度用完或异常再换）
+	// 或 "round_robin"（每个请求轮询换号）。
+	AccountStrategy string `json:"account_strategy"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -99,10 +102,17 @@ func initRuntimeConfig() {
 		AnonFirst:              cfg.AnonFirst,
 		TemporaryChat:          cfg.TemporaryChat,
 		FirefoxFingerprint:     cfg.FirefoxFingerprint,
+		AccountStrategy:        cfg.AccountStrategy,
+	}
+	if base.AccountStrategy == "" {
+		base.AccountStrategy = "sticky"
 	}
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
 		if err := json.Unmarshal([]byte(raw), &saved); err == nil {
+			if saved.AccountStrategy == "" {
+				saved.AccountStrategy = base.AccountStrategy
+			}
 			if err := validateRuntimeConfig(saved); err == nil {
 				base = saved
 			} else {
@@ -157,11 +167,17 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 	if c.GeminiBL == "" {
 		return fmt.Errorf("gemini_bl 不能为空")
 	}
+	if c.AccountStrategy != "" && c.AccountStrategy != "sticky" && c.AccountStrategy != "round_robin" {
+		return fmt.Errorf("account_strategy 必须为 sticky 或 round_robin")
+	}
 	return nil
 }
 
 // saveRuntimeConfig 校验并持久化，成功后立刻生效。
 func saveRuntimeConfig(next RuntimeConfig) error {
+	if next.AccountStrategy == "" {
+		next.AccountStrategy = "sticky"
+	}
 	if err := validateRuntimeConfig(next); err != nil {
 		return err
 	}

@@ -392,6 +392,24 @@ func handleAdminProxyItem(w http.ResponseWriter, r *http.Request) {
 	// /admin/api/proxies/123/(toggle|reset|update|delete)
 	rest := strings.TrimPrefix(r.URL.Path, "/admin/api/proxies/")
 	parts := strings.Split(rest, "/")
+	if len(parts) > 0 {
+		if parts[0] == "probe" {
+			handleAdminProxiesProbe(w, r)
+			return
+		}
+		if parts[0] == "auto-bind" {
+			handleAdminProxiesAutoBind(w, r)
+			return
+		}
+		if parts[0] == "clean-unavailable" {
+			handleAdminProxiesCleanUnavailable(w, r)
+			return
+		}
+		if parts[0] == "import-clash" {
+			handleAdminProxiesImportClash(w, r)
+			return
+		}
+	}
 	if len(parts) < 1 {
 		writeJSON(w, 404, map[string]string{"error": "missing id"})
 		return
@@ -667,6 +685,10 @@ func classifyError(errStr string) string {
 	switch {
 	case errStr == "":
 		return ""
+	case strings.Contains(errStr, "account_quota_exhausted"):
+		return "account_quota_exhausted"
+	case strings.Contains(errStr, errVideoCapacity):
+		return "upstream_rejected"
 	case strings.Contains(errStr, "no content frame"):
 		// 上游返回 200 但一个内容帧都没有。实测是瞬时拒绝，隔几分钟自行恢复，
 		// 跟频率/并发/累积次数都无关，重试即可。

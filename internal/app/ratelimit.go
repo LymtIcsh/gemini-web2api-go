@@ -54,38 +54,107 @@ func getSlot(proxyID int64) *ipSlot {
 	return s
 }
 
-// trySlotAcquire 尝试占一个 slot；超额返回 false + 原因码。
+// trySlotAcquire 尝试占一个 slot；超额返回 (false, 原因码, 预计需等待秒数)。
 // 调用方拿到 true 必须 deferred 调 slotRelease()。
 //
-//	"concurrent" — 已达瞬时并发上限
-//	"rpm"        — 每分钟超限
-//	"rph"        — 每小时超限
-func trySlotAcquire(proxyID int64) (bool, string) {
+// 拒绝类型：
+//   - "concurrent" — 已达瞬时并发上限
+//   - "rpm"        — 每分钟超限
+//   - "rph"        — 每小时超限
+func trySlotAcquire(proxyID int64) (bool, string, int64) {
 	s := getSlot(proxyID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now().Unix()
-	// 清掉过期窗口
+	// 清掉过期窗口（真·滑动时间窗口，不按整点清零）
 	cutMin := now - 60
 	cutHour := now - 3600
 	s.minuteWin = pruneTimestamps(s.minuteWin, cutMin)
 	s.hourWin = pruneTimestamps(s.hourWin, cutHour)
 
 	if rtCfg().PerIPConcurrent > 0 && s.inflight >= rtCfg().PerIPConcurrent {
-		return false, "concurrent"
+		return false, "concurrent", 1
 	}
 	if rtCfg().PerIPRPM > 0 && len(s.minuteWin) >= rtCfg().PerIPRPM {
-		return false, "rpm"
+		waitSec := int64(1)
+		if len(s.minuteWin) > 0 {
+			waitSec = (s.minuteWin[0] + 60) - now
+			if waitSec < 1 {
+				waitSec = 1
+			}
+		}
+		return false, "rpm", waitSec
 	}
 	if rtCfg().PerIPRPH > 0 && len(s.hourWin) >= rtCfg().PerIPRPH {
-		return false, "rph"
+		waitSec := int64(1)
+		if len(s.hourWin) > 0 {
+			// 滑动窗口最旧的一个请求将在其发生时间 + 3600 秒时滑出窗口，释放 1 个配额
+			waitSec = (s.hourWin[0] + 3600) - now
+			if waitSec < 1 {
+				waitSec = 1
+			}
+		}
+		return false, "rph", waitSec
 	}
 
+	// 发送前加锁预扣名额，彻底防止并发漏网突破 80 上限
 	s.inflight++
 	s.minuteWin = append(s.minuteWin, now)
 	s.hourWin = append(s.hourWin, now)
-	return true, ""
+	return true, "", 0
+}
+
+// slotRetryAfter 查询某个出口最快还需多少秒可释放下一个配额。
+func slotRetryAfter(proxyID int64) int64 {
+	s := getSlot(proxyID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	s.minuteWin = pruneTimestamps(s.minuteWin, now-60)
+	s.hourWin = pruneTimestamps(s.hourWin, now-3600)
+
+	waitSec := int64(1)
+	if rtCfg().PerIPRPM > 0 && len(s.minuteWin) >= rtCfg().PerIPRPM && len(s.minuteWin) > 0 {
+		w := (s.minuteWin[0] + 60) - now
+		if w > waitSec {
+			waitSec = w
+		}
+	}
+	if rtCfg().PerIPRPH > 0 && len(s.hourWin) >= rtCfg().PerIPRPH && len(s.hourWin) > 0 {
+		w := (s.hourWin[0] + 3600) - now
+		if w > waitSec {
+			waitSec = w
+		}
+	}
+	if waitSec < 1 {
+		return 1
+	}
+	return waitSec
+}
+
+// minProxyRetryAfter 遍历所有启用的代理出口，计算最快解冻的秒数。
+func minProxyRetryAfter() int64 {
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	minWait := int64(60)
+	first := true
+	for _, p := range proxyCache {
+		if p.Enabled {
+			w := slotRetryAfter(p.ID)
+			if first || w < minWait {
+				minWait = w
+				first = false
+			}
+		}
+	}
+	if first {
+		return slotRetryAfter(0)
+	}
+	if minWait < 1 {
+		return 1
+	}
+	return minWait
 }
 
 // slotRelease 释放并发计数（窗口计数自然过期，不在这里清）。

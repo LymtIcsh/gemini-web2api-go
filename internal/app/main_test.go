@@ -15,7 +15,12 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
+	cfg = defaultConfig()
 	cfg.DBPath = filepath.Join(dir, "test.db")
+	cfg.PerIPRPM = 1000 // 测试环境下放宽默认限额，避免全套数十个测试单秒内并发累加误碰限流
+	cfg.PerIPRPH = 2000
+	initRuntimeConfig()
+
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

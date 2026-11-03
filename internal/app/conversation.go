@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/sha256"
+	"errors"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -176,6 +177,16 @@ func parseConvIDs(raw string) (cid, rid, rcid, tok26 string) {
 					tok26 = s
 				}
 			}
+			// 候选 ID 在已解码的内容帧中，外层 JSON 的转义文本不能直接匹配。
+			if len(f) > 4 {
+				if candidates, ok := f[4].([]interface{}); ok && len(candidates) > 0 {
+					if candidate, ok := candidates[0].([]interface{}); ok && len(candidate) > 0 {
+						if id, ok := candidate[0].(string); ok && strings.HasPrefix(id, "rc_") {
+							rcid = id
+						}
+					}
+				}
+			}
 		}
 	}
 	if m := rcidRe.FindStringSubmatch(raw); m != nil {
@@ -246,9 +257,33 @@ const webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 // cid/rid/rcid/tok26 和 turn+1，供下一轮续接。
 func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
-	p, slotOK, slotErr := acquireSlot(conv.proxyID)
+	if conv.turn == 0 && conv.accountID == 0 && browserAccountsExist() && !anonFirstEligible(mc, false) {
+		return streamBrowserConversation(prompt, mc, conv, onDelta, onReasoning)
+	}
+	_, ready, b, err := accountBrowserState(conv.accountID)
+	if err != nil {
+		return &StreamResult{AccountID: conv.accountID}, err
+	}
+	if conv.isLogin && conv.accountID > 0 && !ready {
+		return &StreamResult{AccountID: conv.accountID}, fmt.Errorf("会话账号已删除、禁用或登录失效，无法继续")
+	}
+	if conv.isLogin && conv.accountID > 0 && !quotaEligible(conv.accountID) {
+		return &StreamResult{AccountID: conv.accountID}, quotaAccountError(conv.accountID)
+	}
+	if b != nil {
+		return streamBrowserConversation(prompt, mc, conv, onDelta, onReasoning)
+	}
+	var p Proxy
+	var slotOK bool
+	var slotErr error
+	if conv.turn > 0 && conv.proxyID > 0 {
+		// 续接已有会话：严格沿用原出口，不随意乱跳代理，避免上下文在 Google 端失效
+		p, slotOK, slotErr = acquireSlotStrict(conv.proxyID)
+	} else {
+		p, slotOK, slotErr = acquireSlot(conv.proxyID)
+	}
 	if !slotOK {
-		return &StreamResult{}, slotErr
+		return &StreamResult{ProxyID: conv.proxyID, AccountID: conv.accountID}, slotErr
 	}
 	defer releaseSlot(p.ID)
 	proxyURL := p.URL
@@ -418,9 +453,24 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, lastErr
 }
 
+type deltaEmitTracker struct {
+	emitted bool
+	cb      func(string)
+}
+
+func (t *deltaEmitTracker) push(s string) {
+	if s != "" {
+		t.emitted = true
+	}
+	if t.cb != nil {
+		t.cb(s)
+	}
+}
+
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
 //   - 命中已知会话 → 只发最后一条新消息（user 或 tool 结果），历史留服务端（绕开字节墙）。
 //   - 没命中 → 新建会话，首轮发全量拼接的历史（含 tools 指令，把当前上下文交给服务端）。
+//   - 会话故障自愈：若当前绑定的账号额度用完或请求异常，且未向客户端吐字，自动切换新账号重构会话。
 //
 // 支持 tools（续接里也解析 ```tool_call``` 围栏）；图片走原单轮路径（callGemini）。
 func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
@@ -430,14 +480,26 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 	conv := convGet(parentKey)
 	fresh := conv == nil
 
+	dt := &deltaEmitTracker{cb: onDelta}
+	rt := &deltaEmitTracker{cb: onReasoning}
+
 	var prompt string
 	if fresh {
 		conv = &convState{}
+		if id := selectedAccountID(); id > 0 {
+			mc.PinAccountID = id
+		}
 		// 有 cookie 池就用登录号（能力更全），否则匿名（首轮就地拿 session cookie）。
 		// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
 		// 恒无，所以第二个参数传 false）。必须在调用前短路：pickCookieAccount 会更新
 		// last_used_at，调了不用等于白占一轮。
-		if !anonFirstEligible(mc, false) {
+		if mc.PinAccountID > 0 {
+			a := accountByID(mc.PinAccountID)
+			if !accountReady(a) {
+				return "", nil, &StreamResult{AccountID: mc.PinAccountID}, fmt.Errorf("固定账号需要重新登录")
+			}
+			conv.cookie, conv.sapisid, conv.isLogin, conv.accountID, conv.proxyID = a.Cookie, extractSAPISID(a.Cookie), true, a.ID, a.ProxyID
+		} else if !anonFirstEligible(mc, false) && !browserAccountsExist() {
 			if a, ok := pickCookieAccount(); ok {
 				conv.cookie = a.Cookie
 				conv.sapisid = extractSAPISID(a.Cookie)
@@ -458,29 +520,83 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 		logf("[conv] 续接命中 turn=%d，只发 %d 字节（历史留服务端）", conv.turn, len(prompt))
 	}
 
-	res, err := streamGenerateConv(prompt, mc, conv, onDelta, onReasoning)
-	if err != nil {
-		if !fresh {
-			// 续接失败：这路会话作废，客户端重试时会当新会话全量重发。
+	res, err := streamGenerateConv(prompt, mc, conv, dt.push, rt.push)
+	if err == nil {
+		text := extractResponseText(res.Raw)
+		var toolCalls []ToolCall
+		if len(tools) > 0 {
+			text, toolCalls = parseToolCalls(text)
+		}
+		if text != "" || len(toolCalls) > 0 {
+			// 存续接状态：客户端下一轮把这段回复原样带回来时，parentKey 会命中这里。
+			// 存的是解析掉围栏后的正文 —— 客户端把 assistant 消息带回来时 content 也是这段。
+			convPut(convChildKey(messages, text), conv)
+			return text, toolCalls, res, nil
+		}
+		err = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw))
+	}
+
+	if !fresh {
+		// 续接失败：这路旧会话作废，避免重试还撞同一路死会话。
+		// 但注意：如果是出口限流（RateLimitError），会话本身未失效，绝不能删除！
+		var rle *RateLimitError
+		if !errors.As(err, &rle) {
 			convDelete(parentKey)
 		}
+	}
+
+	// 故障自愈/无感迁移（Failover）：
+	// 如果是限流错误（RateLimitError），说明是出口限流暂停，不能注销会话，也不能换账号！
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
 		return "", nil, res, err
 	}
-	text := extractResponseText(res.Raw)
-	var toolCalls []ToolCall
-	if len(tools) > 0 {
-		text, toolCalls = parseToolCalls(text)
-	}
-	if text == "" && len(toolCalls) == 0 {
-		if !fresh {
-			convDelete(parentKey)
+
+	// 如果账号未固定（PinAccountID==0），且尚未向客户端吐出任何字（!dt.emitted && !rt.emitted），
+	// 则自动从账号池切换下一个健康且有额度的账号，重构完整历史重新建立会话。
+	if !dt.emitted && !rt.emitted && mc.PinAccountID == 0 && (browserAccountsExist() || !anonFirstEligible(mc, false)) {
+		tried := map[int64]bool{}
+		if conv.accountID > 0 {
+			tried[conv.accountID] = true
 		}
-		return "", nil, res, fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw))
+		logf("[conv] 会话遇到异常 (%v)，未向客户端吐字，触发自动切换新账号重构上下文", err)
+		for attempt := 0; attempt < maxCookieTries; attempt++ {
+			newAcct, ok := pickCookieAccountExcept(tried)
+			if !ok {
+				break
+			}
+			tried[newAcct.ID] = true
+			logf("[conv] 会话切换至新账号 #%d 重试", newAcct.ID)
+			newConv := &convState{
+				cookie:    newAcct.Cookie,
+				sapisid:   extractSAPISID(newAcct.Cookie),
+				isLogin:   true,
+				accountID: newAcct.ID,
+				proxyID:   newAcct.ProxyID,
+				turn:      0,
+			}
+			fullPrompt, _ := messagesToPrompt(messages, tools, toolChoice)
+			res2, err2 := streamGenerateConv(fullPrompt, mc, newConv, dt.push, rt.push)
+			if err2 != nil {
+				if dt.emitted || rt.emitted {
+					return "", nil, res2, err2
+				}
+				continue
+			}
+			t2 := extractResponseText(res2.Raw)
+			var tc2 []ToolCall
+			if len(tools) > 0 {
+				t2, tc2 = parseToolCalls(t2)
+			}
+			if t2 == "" && len(tc2) == 0 {
+				continue
+			}
+			convPut(convChildKey(messages, t2), newConv)
+			return t2, tc2, res2, nil
+		}
 	}
-	// 存续接状态：客户端下一轮把这段回复原样带回来时，parentKey 会命中这里。
-	// 存的是解析掉围栏后的正文 —— 客户端把 assistant 消息带回来时 content 也是这段。
-	convPut(convChildKey(messages, text), conv)
-	return text, toolCalls, res, nil
+
+	return "", nil, res, err
 }
 
 // formatNewTurn 把续接要发的那条新消息格式化，跟 messagesToPrompt 里各角色的写法对齐，

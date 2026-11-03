@@ -21,6 +21,7 @@ func startScheduler() {
 		daily := time.NewTicker(1 * time.Hour)
 		retention := time.NewTicker(6 * time.Hour)
 		proxyReload := time.NewTicker(60 * time.Second)
+		sorrySweep := time.NewTicker(2 * time.Minute)
 		// 会话保活：启动后先尽快刷一次 1PSIDTS（导入的票可能已经快到期），
 		// 之后按服务端在轮转页里指定的间隔走（实测 600 秒）。
 		rotate := time.NewTimer(firstRotateDelay)
@@ -28,6 +29,7 @@ func startScheduler() {
 		defer daily.Stop()
 		defer retention.Stop()
 		defer proxyReload.Stop()
+		defer sorrySweep.Stop()
 		defer rotate.Stop()
 
 		for {
@@ -40,6 +42,8 @@ func startScheduler() {
 				retentionSweep()
 			case <-proxyReload.C:
 				loadProxies()
+			case <-sorrySweep.C:
+				checkSorryCooldownProxies()
 			case <-rotate.C:
 				rotate.Reset(rotateAllAccounts())
 			}
@@ -266,4 +270,40 @@ func retentionSweep() {
 		logf("[retention] purged %d old request rows", n)
 	}
 	_, _ = getDB().Exec(`DELETE FROM sessions WHERE expires_at < ?`, time.Now().Unix())
+}
+
+
+// checkSorryCooldownProxies 周期性扫描遭遇 sorry/index 拦截且冷却期已过的出口。
+// “被拦后恢复”与“额度恢复”严格隔离，不能把“约两小时”当成解封保证盲目放行业务流量。
+// 这里仅使用独立的探测探针（probeProxyURL）进行验活：
+//   - 探测成功（无 sorry 且 Google 正常响应）：解除熔断，平缓恢复入池；
+//   - 探测失败（仍被 sorry 拦截）：顺延暂停，绝不拿用户真实请求冒险。
+func checkSorryCooldownProxies() {
+	now := time.Now().Unix()
+	cooldownSec := int64(rtCfg().ProxyCooldownMin) * 60
+	if cooldownSec <= 0 {
+		return
+	}
+	var toProbe []Proxy
+	proxyMu.RLock()
+	for _, p := range proxyCache {
+		if p.Enabled && p.FailCount >= proxyFailThreshold && isSorryBlocked(p.LastError) {
+			if now-p.LastUsed >= cooldownSec {
+				toProbe = append(toProbe, p)
+			}
+		}
+	}
+	proxyMu.RUnlock()
+
+	for _, p := range toProbe {
+		logf("[proxy] 出口 #%d (%s) 遭遇过 sorry/index 且已过冷却期(%d分)，开始探活检测...", p.ID, p.Name, rtCfg().ProxyCooldownMin)
+		ok, ms, code, errStr := probeProxyURL(p.URL, 8*time.Second)
+		if ok {
+			logf("[proxy] 出口 #%d (%s) 探活成功 (code %d, %dms)，解除 Google 拦截熔断，平缓恢复入池", p.ID, p.Name, code, ms)
+			recordProxyResult(p.ID, true, "")
+		} else {
+			logf("[proxy] 出口 #%d (%s) 探活仍被 Google 拦截 (%s)，保持出口暂停", p.ID, p.Name, errStr)
+			recordProxyResult(p.ID, false, "Google拦截持续中: "+errStr)
+		}
+	}
 }

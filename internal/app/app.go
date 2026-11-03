@@ -144,6 +144,13 @@ func Run() {
 		mux.HandleFunc("/admin/api/config", requireAuth(handleAdminConfig))
 		mux.HandleFunc("/admin/api/cookies", requireAuth(handleAdminCookies))
 		mux.HandleFunc("/admin/api/cookies/", requireAuth(handleAdminCookieItem))
+		mux.HandleFunc("/admin/api/proxies/probe", requireAuth(handleAdminProxiesProbe))
+		mux.HandleFunc("/admin/api/proxies/auto-bind", requireAuth(handleAdminProxiesAutoBind))
+		mux.HandleFunc("/admin/api/proxies/clean-unavailable", requireAuth(handleAdminProxiesCleanUnavailable))
+		mux.HandleFunc("/admin/api/proxies/import-clash", requireAuth(handleAdminProxiesImportClash))
+		mux.HandleFunc("/admin/api/accounts", requireAuth(handleAdminAccounts))
+		mux.HandleFunc("/admin/api/accounts/selection", requireAuth(handleAdminAccountSelection))
+		mux.HandleFunc("/admin/api/accounts/", requireAuth(handleAdminAccountItem))
 		mux.HandleFunc("/admin/api/test", requireAuth(handleAdminTest))
 	}
 

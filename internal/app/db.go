@@ -116,6 +116,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     proxy_id      INTEGER NOT NULL DEFAULT 0      -- 绑定的出口，0 = 还没绑
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_pick ON accounts(status, last_used_at);
+
+CREATE TABLE IF NOT EXISTS browser_accounts (
+    account_id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL DEFAULT '',
+    profile_id VARCHAR(64) NOT NULL UNIQUE,
+    login_state TEXT NOT NULL DEFAULT 'needs_login',
+    last_sync_at INTEGER NOT NULL DEFAULT 0
+);
 `
 
 func getDB() *dbx {
@@ -145,6 +153,14 @@ func getDB() *dbx {
 		conn.SetMaxOpenConns(8)
 		conn.SetMaxIdleConns(4)
 		conn.SetConnMaxLifetime(0)
+		if curDialect == dialectSQLite {
+			if backup, err := backupBeforeBrowserSchema(conn, cfg.DBPath); err != nil {
+				fmt.Fprintf(os.Stderr, "[db] %v\n", err)
+				os.Exit(1)
+			} else if backup != "" {
+				logf("[db] 新增浏览器档案前已备份 %s", backup)
+			}
+		}
 		// mysql/pg 驱动默认不接受多语句 Exec，按方言逐条建表。
 		for _, stmt := range schemaStatements(curDialect) {
 			if _, err := conn.Exec(stmt); err != nil {

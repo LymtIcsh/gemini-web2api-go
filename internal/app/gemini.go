@@ -3,7 +3,9 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -84,13 +86,17 @@ type ModelConfig struct {
 	// Cont, when set, sends this request as the next turn of an existing Gemini
 	// conversation (used for video extension: "reply to the video").
 	Cont *ConvRef
+	// KeepConversation 表示结果仍需续接，不能在第一轮完成后自动删除。
+	KeepConversation bool
+	// Context 传递客户端取消信号，浏览器子请求均沿用此归属。
+	Context context.Context
 }
 
 // ConvRef identifies the turn to continue: conversation id, the previous turn's
 // response id and response-candidate id, and that turn's index (first turn = 0).
 type ConvRef struct {
-	CID, RID, RCID string
-	Turn           int
+	CID, RID, RCID, Tok26 string
+	Turn                  int
 }
 
 // thinkWire 返回思考档线值（填 header 下标15 / inner[80]）：ThinkWire 显式指定优先，
@@ -148,8 +154,13 @@ var Models = map[string]ModelConfig{
 
 // hasCookie 表示 cookie 池里有没有可用账号。决定 3.1 Pro 是否出现在模型列表里。
 func hasCookie() bool {
-	_, enabled := accountCount()
-	return enabled > 0
+	// 模型能力按可用账号池判断；执行时固定旧任务账号或检查当前面板选号。
+	for _, a := range accountList() {
+		if accountReady(&a) {
+			return true
+		}
+	}
+	return false
 }
 
 // modelNeedsLogin 判断一个模型是否必须登录态才真正生效。匿名请求这批会被服务端
@@ -263,25 +274,42 @@ type StreamResult struct {
 	MediaErr string
 }
 
-// RateLimitError 表示所有 IP slot 都达到了限流上限。
-// HTTP handler 看到这个错时返回 429 给客户端。
+// RateLimitError 表示 IP slot 达到了限流上限或被拦截暂停。
+// HTTP handler 看到这个错时返回 429 给客户端，并附带 Retry-After。
 type RateLimitError struct {
-	Reason  string // "concurrent" / "rpm" / "rph"
-	ProxyID int64  // 0 = 直连 slot 满
+	Reason     string // "concurrent" / "rpm" / "rph" / "blocked"
+	ProxyID    int64  // 0 = 直连 slot 满, -1 = 全池满, >0 = 具体代理
+	RetryAfter int64  // 预计多少秒后滚动释放名额
 }
 
 func (e *RateLimitError) Error() string {
+	target := "出口代理"
 	if e.ProxyID == 0 {
-		return "direct IP slot full: " + e.Reason + " limit reached (configure proxies to scale)"
+		target = "直连出口"
+	} else if e.ProxyID == -1 {
+		target = "所有出口代理"
 	}
-	return "all proxy slots full: " + e.Reason + " limit reached"
+	waitMsg := ""
+	if e.RetryAfter > 0 {
+		waitMsg = fmt.Sprintf("，名额正随滑动时间窗口平缓释放，预计在 %d 秒后可用（会话已保留，请稍后重试，请勿更换账号）", e.RetryAfter)
+	}
+	switch e.Reason {
+	case "rph":
+		return fmt.Sprintf("%s已达滚动1小时上限(80次/h)%s", target, waitMsg)
+	case "rpm":
+		return fmt.Sprintf("%s已达分钟速率限制(30次/m)%s", target, waitMsg)
+	case "concurrent":
+		return fmt.Sprintf("%s已达并发上限(5)，正在收尾已发请求，请稍后重试（会话已保留）", target)
+	case "blocked":
+		return fmt.Sprintf("%s已被 Google 拦截或熔断暂停，等待探活恢复中（会话已保留，请勿更换账号）", target)
+	default:
+		return fmt.Sprintf("%s限流中(%s)%s", target, e.Reason, waitMsg)
+	}
 }
 
 // acquireSlot 选一个有容量的 slot 给本次请求用。
 // 优先级：代理池里有容量的代理 → 直连。
 // 全满返回 *RateLimitError。
-//
-// 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
 func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 	// 1. 先试代理池（如果配了）
 	proxyMu.RLock()
@@ -293,25 +321,71 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 			return p, true, nil
 		}
 		// 代理池里有代理但一个都用不上（限流满 / 全禁用 / 全熔断且没过冷却）。
-		// 默认**不退回直连** —— 配了代理池就意味着不想让上游看到本机 IP，
-		// 悄悄直连等于把这个前提废掉，而且日志上只是几条普通请求，很难发现。
-		// 要可用性优先于隐藏 IP 的部署可以打开 fallback_direct。
 		if !rtCfg().FallbackDirect {
-			return Proxy{}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+			return Proxy{}, false, &RateLimitError{Reason: "rph", ProxyID: -1, RetryAfter: minProxyRetryAfter()}
 		}
-		if ok, reason := trySlotAcquire(0); ok {
+		if ok, reason, retryAfter := trySlotAcquire(0); ok {
 			logf("[proxy] 代理池无可用出口，本次退回直连（fallback_direct 已开）")
 			return Proxy{}, true, nil
 		} else {
-			return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: 0}
+			return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: 0, RetryAfter: retryAfter}
 		}
 	}
 
 	// 2. 没配代理池 → 用直连 slot（id=0）
-	if ok, reason := trySlotAcquire(0); ok {
+	if ok, reason, retryAfter := trySlotAcquire(0); ok {
 		return Proxy{}, true, nil // ProxyID=0 表示直连
 	} else {
-		return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: 0}
+		return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: 0, RetryAfter: retryAfter}
+	}
+}
+
+// acquireSlotStrict 用于多轮会话续接，严格绑定原出口 proxyID，不随意漂移出口。
+// 如果绑定的出口达到上限（如 80 RPH），暂停该出口的新请求，返回 RateLimitError（带 RetryAfter），
+// 绝不擅自换代理导致上游会话失效。
+func acquireSlotStrict(proxyID int64) (Proxy, bool, error) {
+	if proxyID <= 0 {
+		// 直连出口
+		if ok, reason, retryAfter := trySlotAcquire(0); ok {
+			return Proxy{}, true, nil
+		} else {
+			return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: 0, RetryAfter: retryAfter}
+		}
+	}
+
+	proxyMu.RLock()
+	var target *Proxy
+	for _, p := range proxyCache {
+		if p.ID == proxyID {
+			target = &p
+			break
+		}
+	}
+	proxyMu.RUnlock()
+
+	if target == nil {
+		// 原代理已被删除，退回普通 acquireSlot
+		return acquireSlot(0)
+	}
+
+	now := time.Now().Unix()
+	cooldown := rtCfg().ProxyCooldownMin
+	if !proxyUsable(*target, now, cooldown) {
+		return Proxy{}, false, &RateLimitError{
+			Reason:     "blocked",
+			ProxyID:    proxyID,
+			RetryAfter: int64(cooldown * 60),
+		}
+	}
+
+	if ok, reason, retryAfter := trySlotAcquire(target.ID); ok {
+		return *target, true, nil
+	} else {
+		return Proxy{}, false, &RateLimitError{
+			Reason:     reason,
+			ProxyID:    target.ID,
+			RetryAfter: retryAfter,
+		}
 	}
 }
 
@@ -368,6 +442,20 @@ type fileRef struct {
 // 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
 func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
+	started := time.Now()
+	result, err := streamGenerateCandidates(prompt, latest, mc, pending, onDelta, onReasoning, map[int64]bool{}, 0)
+	if result != nil {
+		// 完整入口结束后计时，包含准入、附件、历史轮询、下载及失败恢复。
+		result.TotalMs = time.Since(started).Milliseconds()
+	}
+	return result, err
+}
+
+// 提交前换号共享候选集合和鉴权预算，避免晚到限额触发重复选号。
+func streamGenerateCandidates(prompt, latest string, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), tried map[int64]bool, authTries int) (*StreamResult, error) {
+	// 换号必须保留完整入口正文，由新账号重新上传上下文附件。
+	originalPrompt := prompt
 	var files []fileRef
 
 	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
@@ -380,13 +468,41 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	var acct *CookieAccount
 	if mc.PinAccountID > 0 {
 		a := accountByID(mc.PinAccountID)
-		if a == nil || a.Status != "enabled" {
-			return &StreamResult{}, fmt.Errorf("account #%d is not available (deleted or disabled)", mc.PinAccountID)
+		if !accountReady(a) {
+			return &StreamResult{AccountID: mc.PinAccountID}, fmt.Errorf("account #%d is not available (deleted, disabled or needs login)", mc.PinAccountID)
 		}
 		acct = a
 	} else if !anonFirstEligible(mc, len(pending) > 0) {
-		if a, ok := pickCookieAccount(); ok {
+		if a, ok := pickCookieAccountExcept(tried); ok {
 			acct = a
+		}
+	}
+	if selected := selectedAccountID(); selected > 0 && mc.PinAccountID == 0 {
+		mc.PinAccountID = selected
+		acct = accountByID(selected)
+		if !accountReady(acct) {
+			return &StreamResult{AccountID: selected}, fmt.Errorf("固定账号需要重新登录或已禁用")
+		}
+	}
+	if acct == nil && browserAccountsExist() && !anonFirstEligible(mc, len(pending) > 0) {
+		if err := quotaPoolError(mc.PinAccountID); err != nil {
+			return &StreamResult{}, err
+		}
+		return &StreamResult{}, fmt.Errorf("账号池没有已登录的可用账号，请完成网页登录")
+	}
+	if acct != nil && !quotaEligible(acct.ID) {
+		if mc.PinAccountID > 0 {
+			return &StreamResult{AccountID: acct.ID}, quotaAccountError(acct.ID)
+		}
+		if tried == nil {
+			tried = map[int64]bool{}
+		}
+		tried[acct.ID] = true
+		return streamGenerateCandidates(originalPrompt, latest, mc, pending, onDelta, onReasoning, tried, authTries)
+	}
+	if acct == nil && !anonFirstEligible(mc, len(pending) > 0) {
+		if err := quotaPoolError(0); err != nil {
+			return &StreamResult{}, err
 		}
 	}
 	preferProxy := int64(0)
@@ -399,6 +515,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	var picked Proxy
 	var cookieID int64
 	var cookieLabel string
+	var transport *browserTransport
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
@@ -412,37 +529,83 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		return attrib(slotErr)
 	}
 	picked = p
-	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
+	defer func() { releaseSlot(picked.ID) }() // 换号时出口会更新，最终释放实际占用的 slot。
 
 	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
 	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
 	proxyURL := picked.URL
 	pickedOK := picked.ID > 0 // 是否真用了代理池里的代理
 
-	// endpoint 要等出口定下来才能拼：currentBL 可能顺手踢一次后台抓取，
-	// 那个抓取必须跟正式请求走同一个出口，否则配了代理池也会从本机 IP 漏一次。
-	reqid := time.Now().Unix() % 1000000
-	endpoint := fmt.Sprintf(
-		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid,
-	)
-
 	// 取 XSRF token。一个 cookie 失效不该让整个请求失败：当前号取不到就换下一个，
 	// 最多试 maxCookieTries 个。不这么做的话，池子里 2 个号坏 1 个就会让大约一半
 	// 请求挂掉，而每次失败看起来都像上游的问题，用户只会觉得"成功率莫名很低"。
 	//
-	// 换号**不换出口**：出口已经按第一个号的绑定选定了，同一个请求里再换出口没道理。
+	// 换号同步更换档案与账号绑定出口，不能继续沿用上一个账号的浏览器环境。
 	cookieStr, sapisid, xsrfToken := "", "", ""
 	var lastCookieErr error
-	tried := map[int64]bool{}
 	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
 	rotatedOnce := map[int64]bool{}
-	for acct != nil && len(tried) < maxCookieTries {
+	advance := func() error {
+		if mc.PinAccountID > 0 {
+			acct = nil
+			return nil
+		}
+		acct, _ = pickCookieAccountExcept(tried)
+		if acct == nil {
+			return nil
+		}
+		releaseSlot(picked.ID)
+		p, ok, err := acquireSlot(acct.ProxyID)
+		if !ok {
+			picked = Proxy{ID: -1}
+			return err
+		}
+		picked = p
+		proxyURL, pickedOK = picked.URL, picked.ID > 0
+		return nil
+	}
+	for acct != nil && authTries < maxCookieTries {
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		tok, err := getXSRF(acct.Cookie, proxyURL)
+		var err error
+		transport, err = newBrowserTransport(mc.Context, acct, proxyURL)
+		if err != nil {
+			return attrib(err)
+		}
+		if transport != nil {
+			qerr := refreshAccountQuota(mc.Context, acct.ID, &proxyURL)
+			if errors.Is(qerr, context.Canceled) || errors.Is(qerr, context.DeadlineExceeded) {
+				return attrib(qerr)
+			}
+			if !quotaEligible(acct.ID) {
+				if mc.PinAccountID > 0 {
+					return attrib(quotaAccountError(acct.ID))
+				}
+				if err := advance(); err != nil {
+					return attrib(err)
+				}
+				if acct == nil {
+					if err := quotaPoolError(0); err != nil {
+						return attrib(err)
+					}
+					return attrib(fmt.Errorf("账号池没有已登录的可用账号，请完成网页登录"))
+				}
+				continue
+			}
+			if err := transport.available(); err != nil {
+				return attrib(err)
+			}
+		}
+		authTries++
+		tok, err := transportXSRF(transport, acct.Cookie, proxyURL)
 		if err == nil {
+			if transport != nil {
+				acct = accountByID(acct.ID)
+				if acct == nil || !accountReady(acct) {
+					return attrib(fmt.Errorf("账号 #%d 已删除、禁用或登录失效，无法继续生成", cookieID))
+				}
+			}
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
 			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
 			//
@@ -461,7 +624,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
 		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
 		// 只试一次，且只在这一轮。
-		if !rotatedOnce[acct.ID] {
+		if transport == nil && !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
 			if _, _, rerr := rotateAccount(*acct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
@@ -478,16 +641,22 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			}
 		}
 		// 救不回来：记一次失败让面板上看得出是哪个号该换了，然后换下一个。
-		markCookieByStatus(acct.ID, 401, err.Error())
+		if transport != nil && !loginRequired(err) {
+			return attrib(err)
+		}
+		if transport == nil {
+			markCookieByStatus(acct.ID, 401, err.Error())
+		}
 		lastCookieErr = err
 		logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
-		if mc.PinAccountID > 0 {
-			acct = nil // pinned: never switch to another account mid-conversation
-		} else {
-			acct, _ = pickCookieAccountExcept(tried) // 取不到时返回 nil，循环自然结束
+		if err := advance(); err != nil {
+			return attrib(err)
 		}
 	}
 	if lastCookieErr != nil && cookieStr == "" {
+		if err := quotaPoolError(mc.PinAccountID); err != nil {
+			return attrib(err)
+		}
 		if mc.PinAccountID > 0 {
 			return attrib(fmt.Errorf("pinned account #%d is not signed in: %w", mc.PinAccountID, lastCookieErr))
 		}
@@ -501,7 +670,13 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
 		cookieID, cookieLabel = 0, ""
+		transport = nil
 	}
+	// 页面已在账号浏览器中打开后再取构建参数，避免额外从 Go 发匿名探测请求。
+	reqid := time.Now().Unix() % 1000000
+	endpoint := fmt.Sprintf(
+		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+		transportBL(transport, proxyURL), reqid)
 	// 图片附件：上传要 cookie，而且必须走跟正式请求同一个出口，所以排在这里。
 	if len(pending) > 0 {
 		if cookieStr == "" {
@@ -511,7 +686,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		nImg, nVid := 0, 0
 		for _, u := range pending {
-			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
+			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name, transport)
 			if uerr != nil {
 				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
 			}
@@ -528,7 +703,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
 	// 而且必须走跟正式请求同一个出口。
 	budget := rtCfg().MaxPromptBytes
-	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL); ferr != nil {
+	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL, transport); ferr != nil {
 		return attrib(ferr)
 	} else if used {
 		prompt = p
@@ -546,6 +721,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		//   [[[路径, 类型, null, mime], "文件名", null×6, [0]], …]
 		// 类型位是 1=图片 / 3=文本文件 —— 拿 1 传文本文件等于告诉服务端"这是张图"。
 		refs := make([]interface{}, 0, len(files))
+		hasVideoImage := false
 		for _, f := range files {
 			kind := f.Kind
 			if kind == 0 {
@@ -555,13 +731,27 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			if mime == "" {
 				mime = "text/plain"
 			}
+			metadata := []interface{}{f.Ref, kind, nil, mime}
+			if mc.Tool == toolVideo && kind == 1 {
+				// 对齐原生附件元数据的第五槽文件UUID，保持每张参考图标识独立。
+				metadata = append(metadata, uuid.NewString())
+				hasVideoImage = true
+			}
 			refs = append(refs, []interface{}{
-				[]interface{}{f.Ref, kind, nil, mime}, f.Name,
+				metadata, f.Name,
 				nil, nil, nil, nil, nil, nil,
 				[]interface{}{0},
 			})
 		}
-		inner[0] = []interface{}{prompt, 0, nil, refs, nil, nil, 0}
+		input := []interface{}{prompt, 0, nil, refs, nil, nil, 0}
+		if hasVideoImage {
+			// 原生视频页的输入选项：单图与多图均只携带一组，不能按图片数量复制。
+			input = append(input, nil, nil, []interface{}{
+				nil, nil, nil, nil, nil, nil,
+				[]interface{}{[]interface{}{nil, nil, nil, 1}},
+			})
+		}
+		inner[0] = input
 	} else {
 		inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
 	}
@@ -576,7 +766,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	if mc.Cont != nil {
 		// Continue an existing conversation: [cid, rid, rcid, null×6, tok26] + turn index
 		// (same shape as conversation.go's multi-turn path).
-		inner[2] = []interface{}{mc.Cont.CID, mc.Cont.RID, mc.Cont.RCID, nil, nil, nil, nil, nil, nil, ""}
+		inner[2] = []interface{}{mc.Cont.CID, mc.Cont.RID, mc.Cont.RCID, nil, nil, nil, nil, nil, nil, mc.Cont.Tok26}
 		inner[17] = []interface{}{[]interface{}{mc.Cont.Turn}}
 	}
 	inner[18] = 0
@@ -653,7 +843,6 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// cookie 健康度只认 401/403，别的状态不算 cookie 的错，见 markCookieByStatus。
 	lastStatus := 0
 	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
-	t0 := time.Now()
 
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
@@ -680,7 +869,24 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	}
 
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+		if mc.Context != nil && mc.Context.Err() != nil {
+			return attrib(mc.Context.Err())
+		}
+		if transport != nil && !quotaEligible(cookieID) {
+			if attempt == 0 && mc.PinAccountID == 0 {
+				// 生成尚未发出，先释放本次出口，再复用原候选集合继续准入。
+				releaseSlot(picked.ID)
+				picked = Proxy{ID: -1}
+				return streamGenerateCandidates(originalPrompt, latest, mc, pending, onDelta, onReasoning, tried, authTries-1)
+			}
+			return attrib(quotaAccountError(cookieID))
+		}
+		statusCode, raw, ttfb, setCookie, err := doGeminiRequestWithTransport(transport, endpoint, body, geminiHeaders, proxyURL, lineCB)
+		// 已收到视频本轮 ID 时不能因断流重发；确认帧可能迟到，继续按本轮历史取回。
+		if recoverableVideoStream(mc.Tool, statusCode, string(raw), err) {
+			logf("[video] 已收到本轮会话 ID，响应流中断后继续查询视频: %v", err)
+			err = nil
+		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
 				cookieStr = merged
@@ -689,6 +895,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		if err != nil {
 			lastErr = err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || loginRequired(err) {
+				break
+			}
 			if pickedOK {
 				recordProxyResult(picked.ID, false, err.Error())
 			}
@@ -698,7 +907,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if err := transportSleep(mc.Context, time.Duration(rtCfg().RetryDelaySec)*time.Second); err != nil {
+					return attrib(err)
+				}
 			}
 			continue
 		}
@@ -708,7 +919,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
 				invalidateXSRF(cookieStr)
-				if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
+				if transport != nil {
+					transport.page = nil
+				}
+				if tok, e := transportXSRF(transport, cookieStr, proxyURL); e == nil {
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 					geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
@@ -726,7 +940,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if err := transportSleep(mc.Context, time.Duration(rtCfg().RetryDelaySec)*time.Second); err != nil {
+					return attrib(err)
+				}
 			}
 			continue
 		}
@@ -754,7 +970,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if err := transportSleep(mc.Context, time.Duration(rtCfg().RetryDelaySec)*time.Second); err != nil {
+					return attrib(err)
+				}
 			}
 			continue
 		}
@@ -773,7 +991,6 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			AccountID:        cookieID,
 			AccountLabel:     cookieLabel,
 			TTFBMs:           ttfb,
-			TotalMs:          time.Since(t0).Milliseconds(),
 		}
 		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
 		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。
@@ -792,7 +1009,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			result.ConvCID, result.ConvRID = cid, rid
 			arts, rcid, aerr := fetchMediaArtifacts(
 				mc.Tool, string(raw), cid, rid,
-				cookieStr, sapisid, xsrfToken, proxyURL, mime)
+				cookieStr, sapisid, xsrfToken, proxyURL, mime, transport)
 			result.ConvRCID = rcid
 			if aerr != nil {
 				logf("[media] 取回产物失败: %v", aerr)
@@ -807,9 +1024,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		//
 		// 临时对话（#34）生效时跳过：那条压根没进会话列表，删它是多发一次 RPC 删空气。
 		// 这正是临时对话比 create-then-delete 省的那一次出站请求。
-		if rtCfg().AutoDeleteConversation && !temporaryChatEligible() && cookieStr != "" && xsrfToken != "" {
+		if rtCfg().AutoDeleteConversation && !rtCfg().MultiTurn && !mc.KeepConversation && mc.Cont == nil && !temporaryChatEligible() && cookieStr != "" && xsrfToken != "" {
 			if cid := extractConversationID(string(raw)); cid != "" {
-				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
+				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL, transport)
 			}
 		}
 		return result, nil
@@ -1079,6 +1296,19 @@ func textsInLine(line string) []string {
 // queued upstream (a conversation was created), even without a text content frame.
 func videoAccepted(tool int, raw string) bool {
 	return tool == toolVideo && extractConversationID(raw) != ""
+}
+
+// 本轮 ID 允许断流后查询历史；产物确认与拒绝仍由按响应 ID 隔离的媒体轮询判断。
+func recoverableVideoStream(tool, status int, raw string, err error) bool {
+	if tool != toolVideo || status != 200 || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var b *browserError
+	if errors.As(err, &b) && b.Code != "browser_error" {
+		return false
+	}
+	cid, rid, _, _ := parseConvIDs(raw)
+	return cid != "" && rid != ""
 }
 
 // hasContentFrame 判断响应里到底有没有内容帧。

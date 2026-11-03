@@ -130,12 +130,7 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodDelete:
-		if err := accountDelete(id); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		logf("[cookies] 删除账号 #%d", id)
-		writeJSON(w, 200, map[string]bool{"ok": true})
+		deleteAdminAccount(w, r, id)
 	case http.MethodPost:
 		if action == "rotate" {
 			for _, a := range accountList() {

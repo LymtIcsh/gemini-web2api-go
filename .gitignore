@@ -25,3 +25,19 @@ vendor/
 
 # ─── 本地工程笔记（给 Claude 跨会话续接，不入库不分发）──
 docs/local/
+
+# 本机配置、账号资料与代理工具记录
+/config.json
+.env.*
+!.env.example
+.codex/
+.agents/
+.gemini/
+/verification.md
+
+# 浏览器依赖、分发包与运行输出
+node_modules/
+/packages/
+/err.txt
+/run_err.txt
+/run_out.txt

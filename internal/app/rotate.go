@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,6 +61,12 @@ var rotateInitRe = regexp.MustCompile(`init\('([^']{4,64})'\s*,\s*([0-9.]+)\s*,[
 // rotateAccount 给一个账号做一次保活：先刷 1PSIDTS，再刷 SIDCC。
 // 返回服务端建议的下次间隔，以及这一轮实际刷新的 cookie 名。
 func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
+	if b, err := browserAccountByID(a.ID); err != nil {
+		return 0, nil, err
+	} else if b != nil {
+		_, err := browserAccountAction(context.Background(), &a, "refresh")
+		return defaultRotateInterval, nil, err
+	}
 	proxyURL := ""
 	if a.ProxyID > 0 {
 		proxyURL = proxyURLByID(a.ProxyID)
@@ -371,6 +378,9 @@ func rotateAllAccounts() time.Duration {
 	next := defaultRotateInterval
 	for _, a := range accountList() {
 		if a.Status != "enabled" {
+			continue
+		}
+		if b, err := browserAccountByID(a.ID); err != nil || (b != nil && b.LoginState != "ready") {
 			continue
 		}
 		iv, _, err := rotateAccount(a)

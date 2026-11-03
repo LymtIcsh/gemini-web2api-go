@@ -132,17 +132,17 @@ func filterDownloadCookies(cookie string) string {
 // (video extension) the history also holds earlier turns' videos, which must not be
 // mistaken for this one. Returns the turn's response-candidate id (rcid) as well,
 // which is needed to continue the conversation again.
-func fetchMediaArtifacts(tool int, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, string, error) {
+func fetchMediaArtifacts(tool int, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, transports ...*browserTransport) ([]MediaArtifact, string, error) {
 	if tool == toolImage {
-		arts, err := fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
+		arts, err := fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, transports...)
 		return arts, "", err
 	}
 	// 音乐几乎立刻就绪，视频要生成几十秒到几分钟，所以视频轮询给足预算。
 	maxPolls, interval := 6, 2*time.Second
-	if tool == toolVideo {
-		maxPolls, interval = 45, 8*time.Second // 约 6 分钟
+	if tool == toolVideo || defaultMime == "video/mp4" {
+		maxPolls, interval = 150, 8*time.Second // 约 20 分钟
 	}
-	arts, rcid, err := fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, tool, maxPolls, interval)
+	arts, rcid, err := fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, tool, maxPolls, interval, transports...)
 	if err != nil {
 		return arts, rcid, err
 	}
@@ -163,6 +163,17 @@ const errVideoQuota = "video_quota_exhausted"
 // errVideoRefused prefixes the error when Gemini answers with text instead of
 // starting a video (a refusal); resubmitting the same prompt won't help.
 const errVideoRefused = "video_refused"
+
+// errVideoCapacity 表示上游生成服务容量不足，不能作为账号额度耗尽处理。
+const errVideoCapacity = "video_capacity_exhausted"
+
+// videoCapacityExceeded 只检查模型本轮回复，避免用户提示词或工具元数据触发失败。
+func videoCapacityExceeded(reply string) bool {
+	lower := strings.ToLower(reply)
+	return strings.Contains(reply, "系统已达到容量上限") ||
+		(strings.Contains(lower, "video generation") &&
+			(strings.Contains(lower, "at capacity") || strings.Contains(lower, "reached capacity")))
+}
 
 // isMP4 reports whether b starts with an ISO-BMFF box header ("....ftyp").
 func isMP4(b []byte) bool {
@@ -256,17 +267,19 @@ func mp4InProtobuf(b []byte, depth int) []byte {
 
 // fetchImageArtifacts 取回生成的图片。链在 StreamGenerate 响应里就有，抠不到再退回轮询
 // hNvQHb。下载走 mediaGetFollow（跟随 302 并每跳重发 cookie）。
-func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, error) {
+func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, transports ...*browserTransport) ([]MediaArtifact, error) {
 	urls := collectImageURLs(raw)
 	if len(urls) == 0 {
 		for i := 0; i < 6; i++ {
-			if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err == nil {
+			if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, transports...); err == nil {
 				if u := collectImageURLs(body); len(u) > 0 {
 					urls = u
 					break
 				}
 			}
-			time.Sleep(2 * time.Second)
+			if err := sleepWithTransport(transports, 2*time.Second); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if len(urls) == 0 {
@@ -274,7 +287,7 @@ func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime 
 	}
 	var arts []MediaArtifact
 	for _, u := range urls {
-		mime, data, err := downloadBytes(imageFullResURL(u), cookie, proxyURL, defaultMime)
+		mime, data, err := downloadBytes(imageFullResURL(u), cookie, proxyURL, defaultMime, transports...)
 		if err != nil {
 			return arts, err
 		}
@@ -309,19 +322,21 @@ func imageFullResURL(u string) string {
 // fetchDownloadArtifacts 取回音乐/视频：轮询 hNvQHb 等到 response_data 下载链，再下。
 // gg-dl（lh3）和 temp_data 那两种链是预览用的，只有 response_data 那条能下到真字节。
 func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, tool int,
-	maxPolls int, interval time.Duration) ([]MediaArtifact, string, error) {
+	maxPolls int, interval time.Duration, transports ...*browserTransport) ([]MediaArtifact, string, error) {
 	if cid == "" {
 		return nil, "", fmt.Errorf("没拿到会话 id，无法定位产物")
 	}
 	var dlURLs []string
 	rcid := ""
 	for i := 0; i < maxPolls; i++ {
-		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err == nil {
+		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, transports...); err == nil {
 			if rid != "" {
 				// Only this request's turn; skip polls where it hasn't shown up yet.
 				scoped, ok := historyTurn(body, rid)
 				if !ok {
-					time.Sleep(interval)
+					if err := sleepWithTransport(transports, interval); err != nil {
+						return nil, rcid, err
+					}
 					continue
 				}
 				body = scoped
@@ -333,8 +348,14 @@ func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMi
 			// video tool, e.g. "I'm having a hard time fulfilling your request." Nothing
 			// will ever be generated, so fail now with Gemini's own words.
 			if tool == toolVideo {
-				if reply, ok := turnReplyText(body); ok && !strings.Contains(body, "video_generation") {
-					return nil, rcid, fmt.Errorf("%s: Gemini declined to make this video: %q (rephrase the prompt; real-artist styles, copyrighted lyrics and violent wording are common triggers)", errVideoRefused, truncate(reply, 200))
+				if reply, ok := turnReplyText(body); ok {
+					// 容量拒绝仍可能携带 video_generation，明确失败必须先于工具标记判断。
+					if videoCapacityExceeded(reply) {
+						return nil, rcid, fmt.Errorf("%s: Gemini video generation is temporarily unavailable: %s", errVideoCapacity, strings.TrimSpace(reply))
+					}
+					if !strings.Contains(body, "video_generation") {
+						return nil, rcid, fmt.Errorf("%s: Gemini declined to make this video: %q (rephrase the prompt; real-artist styles, copyrighted lyrics and violent wording are common triggers)", errVideoRefused, truncate(reply, 200))
+					}
 				}
 			}
 			if picked := pickResponseDataURLs(collectDownloadURLs(body)); len(picked) > 0 {
@@ -353,7 +374,9 @@ func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMi
 				return nil, rcid, fmt.Errorf("%s: this account's video generation limit is used up (resets later); resubmit to use another account", errVideoQuota)
 			}
 		}
-		time.Sleep(interval)
+		if err := sleepWithTransport(transports, interval); err != nil {
+			return nil, rcid, err
+		}
 	}
 	if len(dlURLs) == 0 {
 		return nil, rcid, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
@@ -368,7 +391,7 @@ func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMi
 			}
 			u += sep + "filename=artifact&opi=" + downloadOPI
 		}
-		mime, data, err := downloadBytes(u, cookie, proxyURL, defaultMime)
+		mime, data, err := downloadBytes(u, cookie, proxyURL, defaultMime, transports...)
 		if err != nil {
 			return arts, rcid, err
 		}
@@ -466,7 +489,8 @@ func turnReplyText(body string) (string, bool) {
 }
 
 // pollHistoryRaw 调一次 hNvQHb 取会话历史，返回原始响应体。
-func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error) {
+func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, transports ...*browserTransport) (string, error) {
+	t := firstBrowserTransport(transports)
 	inner, _ := json.Marshal([]interface{}{cid, 10, nil, 1, []interface{}{0}, []interface{}{4}, nil, 1})
 	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"hNvQHb", string(inner), nil, "generic"}}})
 	form := url.Values{}
@@ -477,13 +501,13 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error)
 	reqid := time.Now().UnixNano() % 1000000
 	endpoint := fmt.Sprintf(
 		"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid)
+		transportBL(t, proxyURL), reqid)
 
 	// batchexecute 不带模型 header，其余（cookie / SAPISIDHASH / x-same-domain）跟主请求同款。
 	headers := buildGeminiHeaders(cookie, sapisid, "")
 	delete(headers, "x-goog-ext-525001261-jspb")
 
-	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	status, _, body, err := transportUploadPost(t, endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -501,7 +525,8 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error)
 //
 // 只登录态可用（匿名没有 XSRF、会话也没落到账号里）。best-effort：删失败只记日志，
 // 不影响已经返给客户端的响应。
-func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string) {
+func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string, transports ...*browserTransport) {
+	t := firstBrowserTransport(transports)
 	inner, _ := json.Marshal([]interface{}{cid})
 	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"GzXR5e", string(inner), nil, "generic"}}})
 	form := url.Values{}
@@ -510,10 +535,10 @@ func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string) {
 	reqid := time.Now().UnixNano() % 1000000
 	endpoint := fmt.Sprintf(
 		"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=GzXR5e&bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid)
+		transportBL(t, proxyURL), reqid)
 	headers := buildGeminiHeaders(cookie, sapisid, "")
 	delete(headers, "x-goog-ext-525001261-jspb")
-	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	status, _, body, err := transportUploadPost(t, endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		logf("[autodel] 删会话 %s 失败: %v", cid, err)
 		return
@@ -631,14 +656,14 @@ func downloadIsResponseData(rawURL string) bool {
 
 // downloadBytes GET 一条产物链，跟随重定向并每跳重发 cookie 子集，返回 content-type
 // 和原始字节。图片链（会 302）和 contribution 链（单次 200）都走这个。
-func downloadBytes(rawURL, cookie, proxyURL, defaultMime string) (string, []byte, error) {
+func downloadBytes(rawURL, cookie, proxyURL, defaultMime string, transports ...*browserTransport) (string, []byte, error) {
 	headers := map[string]string{
 		"Cookie":  filterDownloadCookies(cookie),
 		"Origin":  "https://gemini.google.com",
 		"Referer": "https://gemini.google.com/",
 		"Accept":  "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
 	}
-	status, respHead, body, err := mediaGetFollow(rawURL, headers, proxyURL)
+	status, respHead, body, err := transportMediaGet(firstBrowserTransport(transports), rawURL, headers, proxyURL)
 	if err != nil {
 		return "", nil, err
 	}
@@ -648,6 +673,9 @@ func downloadBytes(rawURL, cookie, proxyURL, defaultMime string) (string, []byte
 	mime := respHead["content-type"]
 	if i := strings.IndexByte(mime, ';'); i >= 0 {
 		mime = strings.TrimSpace(mime[:i])
+	}
+	if firstBrowserTransport(transports) != nil && strings.HasPrefix(mime, "text/html") {
+		return "", nil, fmt.Errorf("下载产物返回 HTML 页面，可能需要重新登录")
 	}
 	if mime == "" || strings.HasPrefix(mime, "text/html") {
 		mime = defaultMime

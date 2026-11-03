@@ -74,7 +74,7 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req map[string]any
-	var fileRef *pendingUpload
+	var images []pendingUpload
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		// OpenAI SDK shape: videos.create(prompt=..., input_reference=<file>) is multipart.
 		if err := r.ParseMultipartForm(maxImageBytes + 1<<20); err != nil {
@@ -87,19 +87,30 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 				req[k] = v[0]
 			}
 		}
-		if f, hdr, err := r.FormFile("input_reference"); err == nil {
-			data, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes+1))
-			f.Close()
-			mime := hdr.Header.Get("Content-Type")
-			if mime == "" || mime == "application/octet-stream" {
-				mime = http.DetectContentType(data)
+		// Collect all uploaded reference images (supports input_reference, first_frame, image[], images, image)
+		seenFiles := map[string]bool{}
+		for _, key := range []string{"input_reference", "first_frame", "image[]", "images", "image"} {
+			if fheaders, ok := r.MultipartForm.File[key]; ok {
+				for _, hdr := range fheaders {
+					if seenFiles[hdr.Filename] {
+						continue
+					}
+					seenFiles[hdr.Filename] = true
+					if f, err := hdr.Open(); err == nil {
+						data, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes+1))
+						f.Close()
+						if rerr == nil && len(data) > 0 {
+							mime := hdr.Header.Get("Content-Type")
+							if mime == "" || mime == "application/octet-stream" {
+								mime = http.DetectContentType(data)
+							}
+							if up, uerr := newMediaUpload(data, mime, 1); uerr == nil {
+								images = append(images, up)
+							}
+						}
+					}
+				}
 			}
-			up, uerr := newMediaUpload(data, mime, 1)
-			if rerr != nil || uerr != nil {
-				writeJSON(w, 400, map[string]any{"error": map[string]string{"message": fmt.Sprintf("input_reference: %v%v", rerr, uerr), "type": "invalid_request_error"}})
-				return
-			}
-			fileRef = &up
 		}
 	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "bad json body"}})
@@ -124,16 +135,15 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 	// Image→video: OpenAI Sora's `input_reference` (start frame). Accepts a data: URL,
 	// an http(s) URL, or {"image_url": "..."} / {"url": "..."}. Materialized now so a
 	// bad image fails the POST (400) instead of a queued job.
-	var images []pendingUpload
-	if fileRef != nil {
-		images = append(images, *fileRef)
-	} else if ref := inputReferenceSrc(req["input_reference"]); ref != "" {
-		img, err := materializeImage(ref, "", 1)
-		if err != nil {
-			writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "input_reference: " + err.Error(), "type": "invalid_request_error"}})
-			return
+	if len(images) == 0 {
+		if ref := inputReferenceSrc(req["input_reference"]); ref != "" {
+			img, err := materializeImage(ref, "", 1)
+			if err != nil {
+				writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "input_reference: " + err.Error(), "type": "invalid_request_error"}})
+				return
+			}
+			images = append(images, img)
 		}
-		images = append(images, img)
 	}
 	size, err := videoSize(req)
 	if err != nil {
@@ -222,7 +232,7 @@ func runVideoJobWith(j *videoJob, images []pendingUpload, pin int64, cont *ConvR
 		videoJobsMu.Unlock()
 	}
 	if err != nil {
-		recordRequest("videos", j.Model, j.Prompt, "", res, 502, err.Error(), false)
+		recordRequest("videos", j.Model, j.Prompt, "", res, generationErrorStatus(err), err.Error(), false)
 		finishVideoJob(j, nil, "", err.Error())
 		return
 	}

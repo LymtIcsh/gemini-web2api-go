@@ -70,14 +70,17 @@ func loadProxies() {
 // 连续失败到这个次数就把代理熔断，等冷却期过了再放回池子。
 const proxyFailThreshold = 5
 
+// isSorryBlocked 判断是否命中 Google 明确的人机验证/IP风控拦截 (sorry/index 或 302 拦截跳转)。
+func isSorryBlocked(errStr string) bool {
+	low := strings.ToLower(errStr)
+	return strings.Contains(low, "sorry") || strings.Contains(low, "302") || strings.Contains(low, "blocked_sorry")
+}
+
 // proxyUsable 判断这条代理现在能不能用。
 //
-// 熔断不是永久除名：被 Google 拦掉的出口实测 106-121 分钟就自动恢复，而旧写法
-// 只认 fail_count<5，一旦超了就再也选不中，也就永远等不到一次成功把 fail_count
-// 清零 —— 只能去面板手动重置。冷却期从 last_used（也就是最后一次尝试）算起，
-// 放回去再失败一次就重新计时。
-//
-// cooldownMin<=0 表示关掉冷却，退回"熔断即永久除名"的旧行为。
+// 1. 普通网络抖动熔断（FailCount>=5 且非 sorry）：冷却期过后允许放回池子重新尝试。
+// 2. 被 Google 明确拦截（sorry/index）：绝不能把“约两小时”当成解封保证，
+//    禁止单凭时间流逝自动放行，必须保持暂停，直到后台探活通过或人工重置。
 func proxyUsable(p Proxy, now int64, cooldownMin int) bool {
 	if !p.Enabled {
 		return false
@@ -86,6 +89,10 @@ func proxyUsable(p Proxy, now int64, cooldownMin int) bool {
 		return true
 	}
 	if cooldownMin <= 0 {
+		return false
+	}
+	// sorry/index 触发的被拦状态，与额度恢复严格隔离，不作为解封保证
+	if isSorryBlocked(p.LastError) {
 		return false
 	}
 	return now-p.LastUsed >= int64(cooldownMin)*60
@@ -235,16 +242,9 @@ func poolHasProxyURL(url string) bool {
 
 // pickProxyWithCapacity 找一个可用（enabled + 没熔断或已过冷却）且限流没满的代理。
 // 返回 (proxy, ok)。所有代理都不可用或都满时返回 ok=false。
-//
-// 跟旧的 pickProxy 区别：会问 trySlotAcquire 看 slot 是否有容量；
-// 调用方拿到的 slot 必须配套调 slotRelease(proxy.ID)。
 func pickProxyWithCapacity() (Proxy, bool) { return pickProxyPreferring(0) }
 
 // pickProxyPreferring 优先挑 preferID 那个出口，它不可用或没容量时才轮询别的。
-//
-// 为什么要粘住：cookie 池和代理池各自独立轮转的话，同一个 Google 账号会在几十个
-// 出口 IP 之间来回跳 —— 这在 Google 眼里正是账号共享的特征。粘不住时宁可换出口
-// 也不排队等，可用性优先。
 func pickProxyPreferring(preferID int64) (Proxy, bool) {
 	proxyMu.RLock()
 	defer proxyMu.RUnlock()
@@ -265,7 +265,7 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 	if preferID > 0 {
 		for _, p := range pool {
 			if p.ID == preferID {
-				if ok, _ := trySlotAcquire(p.ID); ok {
+				if ok, _, _ := trySlotAcquire(p.ID); ok {
 					return p, true
 				}
 				break // 绑的那个满了，往下走正常轮询
@@ -276,7 +276,7 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 	start := atomic.AddUint64(&proxyCursor, 1) - 1
 	for i := 0; i < len(pool); i++ {
 		p := pool[(int(start)+i)%len(pool)]
-		if ok, _ := trySlotAcquire(p.ID); ok {
+		if ok, _, _ := trySlotAcquire(p.ID); ok {
 			return p, true
 		}
 	}
@@ -284,23 +284,23 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 }
 
 // recordProxyResult 回写一次请求的结果，并同步更新内存里那一条。
-//
-// 只改内存里的那一条，不整表重读：这个函数每个请求都会调，重读一次就是一次全表
-// SELECT，而它自己刚发起过 UPDATE —— 高并发下正是这对读写在 WAL 上撞出 SQLITE_BUSY，
-// 也就是代理池被读空、请求退回直连的触发条件。
-//
-// 代价是内存里的 FailCount++ 和 DB 的 fail_count+1 各算各的，别的进程直接改库会
-// 让两边漂移。单进程持有这个库，重启也会从 DB 重新加载，可以接受。
 func recordProxyResult(id int64, success bool, errStr string) {
 	if id == 0 {
 		return
 	}
 	now := time.Now().Unix()
+	isSorry := isSorryBlocked(errStr)
 	if success {
 		_, _ = getDB().Exec(`UPDATE proxies SET fail_count=0, last_used=?, last_error='' WHERE id=?`, now, id)
 	} else {
-		_, _ = getDB().Exec(`UPDATE proxies SET fail_count=fail_count+1, last_used=?, last_error=? WHERE id=?`,
-			now, errStr, id)
+		if isSorry {
+			// 一旦命中 sorry/index，立即触发熔断，避免剩余请求继续撞墙
+			_, _ = getDB().Exec(`UPDATE proxies SET fail_count=?, last_used=?, last_error=? WHERE id=?`,
+				proxyFailThreshold, now, errStr, id)
+		} else {
+			_, _ = getDB().Exec(`UPDATE proxies SET fail_count=fail_count+1, last_used=?, last_error=? WHERE id=?`,
+				now, errStr, id)
+		}
 	}
 	proxyMu.Lock()
 	for i := range proxyCache {
@@ -312,7 +312,11 @@ func recordProxyResult(id int64, success bool, errStr string) {
 			proxyCache[i].FailCount = 0
 			proxyCache[i].LastError = ""
 		} else {
-			proxyCache[i].FailCount++
+			if isSorry {
+				proxyCache[i].FailCount = proxyFailThreshold
+			} else {
+				proxyCache[i].FailCount++
+			}
 			proxyCache[i].LastError = errStr
 		}
 		break
@@ -343,10 +347,6 @@ func proxyCreate(name, url string, weight int) (int64, error) {
 
 // validateProxyURL 校验代理 URL 协议。
 // 支持 http / https / socks5 / socks5h。
-//
-// scheme 按大小写不敏感比：URL 的 scheme 本来就不区分大小写，url.Parse 会统一转小写，
-// 所以 HTTP:// 在 4.0.0 那条不做校验的静态代理路径上是能正常工作的。校验若大小写
-// 敏感，升级时就会把这种值拦下来 —— 用户什么都没改，代理却不工作了。
 func validateProxyURL(s string) error {
 	low := strings.ToLower(s)
 	for _, p := range []string{"http://", "https://", "socks5://", "socks5h://"} {
@@ -396,6 +396,7 @@ func proxyUpdate(id int64, name, url string, enabled *bool, weight *int) error {
 func proxyDelete(id int64) error {
 	_, err := getDB().Exec(`DELETE FROM proxies WHERE id=?`, id)
 	if err == nil {
+		_, _ = getDB().Exec(`UPDATE accounts SET proxy_id=0 WHERE proxy_id=?`, id)
 		loadProxies()
 	}
 	return err
@@ -444,7 +445,6 @@ func proxyNameByID(id int64) string {
 }
 
 // proxyUsableByID 这个出口现在还能不能用（存在 + enabled + 没熔断或已过冷却）。
-// 判断账号绑定的出口是不是还有效，无效才该重新绑。
 func proxyUsableByID(id int64) bool {
 	if id <= 0 {
 		return false

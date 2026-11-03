@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"strconv"
 	"fmt"
 	"io"
 	"net/http"
@@ -150,15 +151,14 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 		}
 		return doc, nil, res, nil
 	}
-	// 媒体模型（生图/音乐）：生成 200 了但产物字节没取回来，直接报错而不是返回一个
-	// 只有文字没有图的半成品 —— 客户端要的就是那张图/那段乐。
+	// 媒体接口返回正常只代表已接受；上游生成和产物下载任一失败都要保留具体原因。
 	if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
 		if len(res.Artifacts) == 0 {
 			msg := res.MediaErr
 			if msg == "" {
 				msg = "媒体产物取回失败"
 			}
-			return "", nil, res, fmt.Errorf("media generation succeeded but artifact retrieval failed: %s", msg)
+			return "", nil, res, fmt.Errorf("media request failed: %s", msg)
 		}
 		// 产物以 base64 data URL 追加到正文（可能没正文，只有图/乐/视频）。
 		text = appendArtifactMarkdown(text, res.Artifacts)
@@ -289,6 +289,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var gate *toolFenceGate
 	var onDelta, onReasoning func(string)
 	if stream {
+		ctx, stop := withHTTPWriteCancellation(r.Context(), w)
+		defer stop()
+		r = r.WithContext(ctx)
 		sse = newSSEWriter(w, cid, created, modelName)
 		onReasoning = sse.SendReasoning
 		if len(tools) == 0 {
@@ -302,6 +305,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
+	modelCfg.Context = r.Context()
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
 		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
@@ -309,9 +313,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
 	}
 	if err != nil {
-		recordRequest("chat.completions", modelName, prompt, "", res, 502, err.Error(), stream)
+		recordRequest("chat.completions", modelName, prompt, "", res, generationErrorStatus(err), err.Error(), stream)
 		if sse != nil && sse.Started() {
 			sse.Fail(err) // 已经开流，HTTP 状态码改不了了
+			return
+		}
+		if quotaHTTPError(w, err) {
 			return
 		}
 		if ptl, ok := err.(*PromptTooLongError); ok {
@@ -323,10 +330,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rle, ok := err.(*RateLimitError); ok {
-			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
-				"message": rle.Error(),
-				"type":    "rate_limit_exceeded",
-				"code":    "ip_slot_full",
+			if rle.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.FormatInt(rle.RetryAfter, 10))
+			}
+			writeJSON(w, 429, map[string]interface{}{"error": map[string]interface{}{
+				"message":     rle.Error(),
+				"type":        "rate_limit_exceeded",
+				"code":        "ip_slot_full",
+				"retry_after": rle.RetryAfter,
 			}})
 			return
 		}
@@ -591,6 +602,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var gate *toolFenceGate
 	var onDelta func(string)
 	if stream {
+		ctx, stop := withHTTPWriteCancellation(r.Context(), w)
+		defer stop()
+		r = r.WithContext(ctx)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
@@ -598,6 +612,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		flusher, _ := w.(http.Flusher)
 		writeEvent = func(eventType string, payload interface{}) {
+			if r.Context().Err() != nil {
+				return
+			}
 			pj, _ := json.Marshal(payload)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, pj)
 			if flusher != nil {
@@ -658,13 +675,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
+	modelCfg.Context = r.Context()
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
 		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
 	} else {
 		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
 	}
 	if err != nil {
-		recordRequest("responses", modelName, prompt, "", res, 502, err.Error(), stream)
+		recordRequest("responses", modelName, prompt, "", res, generationErrorStatus(err), err.Error(), stream)
 		if stream {
 			writeEvent("response.failed", map[string]interface{}{
 				"type": "response.failed",
@@ -673,9 +691,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 					"object": "response",
 					"status": "failed",
 					"model":  modelName,
-					"error":  map[string]string{"message": err.Error()},
+					"error":  generationErrorBody(err),
 				},
 			})
+			return
+		}
+		if quotaHTTPError(w, err) {
 			return
 		}
 		if ptl, ok := err.(*PromptTooLongError); ok {
@@ -687,10 +708,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rle, ok := err.(*RateLimitError); ok {
-			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
-				"message": rle.Error(),
-				"type":    "rate_limit_exceeded",
-				"code":    "ip_slot_full",
+			if rle.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.FormatInt(rle.RetryAfter, 10))
+			}
+			writeJSON(w, 429, map[string]interface{}{"error": map[string]interface{}{
+				"message":     rle.Error(),
+				"type":        "rate_limit_exceeded",
+				"code":        "ip_slot_full",
+				"retry_after": rle.RetryAfter,
 			}})
 			return
 		}

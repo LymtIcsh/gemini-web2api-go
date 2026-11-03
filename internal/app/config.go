@@ -57,6 +57,9 @@ type Config struct {
 	// Impersonate（默认 Chrome）。直连才是完整 Firefox 指纹，走代理时 TLS 这层仍是 Go 标准库
 	// 的（隧道限制，改不了）。默认 false。见 client.go 的 isFirefoxProfile / effectiveImpersonate。
 	FirefoxFingerprint bool `json:"firefox_fingerprint"`
+	// AccountStrategy 控制账号池的选号策略："sticky"（默认，粘性单号优先，单号用满或异常再换号）
+	// 或 "round_robin"（每个请求轮询换号）。
+	AccountStrategy string `json:"account_strategy"`
 }
 
 var (
@@ -100,6 +103,7 @@ func defaultConfig() Config {
 		AnonFirst:              false,
 		TemporaryChat:          false,
 		FirefoxFingerprint:     false,
+		AccountStrategy:        "sticky",
 	}
 }
 

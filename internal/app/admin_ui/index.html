@@ -299,6 +299,31 @@
                height: calc(100vh - var(--topbar-h) - 44px); margin-bottom: 0; }
   .table-scroll { flex: 1; min-height: 0; overflow: auto; }
   .table-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--card); }
+  /* 两个额度窗口各自保留比例和网页时间；窄屏沿用表格内滚动。 */
+  .account-table { min-width: 1800px; }
+  .quota-cell, .quota-detail { font-size: 12px; line-height: 1.65; }
+  .quota-window + .quota-window { margin-top: 12px; }
+  .quota-values { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px; }
+  .quota-values > * { white-space: nowrap; }
+  .quota-status .badge { max-width: 100%; white-space: normal; }
+  .quota-used, .quota-remaining, .quota-countdown { font-variant-numeric: tabular-nums; }
+  .quota-window progress { display: block; width: 100%; height: 5px; margin: 5px 0; accent-color: var(--g-blue); }
+  .quota-window.exhausted progress { accent-color: var(--fail); }
+  .quota-meta { color: var(--muted); font-size: 11px; }
+  .quota-detail > div + div { margin-top: 6px; }
+  .quota-error, .fixed-quota-warning, .account-sync-error { color: var(--fail); }
+  .fixed-quota-warning { margin: 0 0 12px; font-size: 12px; }
+  .account-sync-error { margin-bottom: 12px; font-size: 12px; }
+  .account-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .account-batch-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 9px 16px; margin-bottom: 14px;
+    background: var(--nav-hover); border-radius: var(--r-card);
+    border: 1px solid var(--outline-soft);
+  }
+  .account-table input[type=checkbox] {
+    width: 15px; height: 15px; cursor: pointer; accent-color: var(--g-blue); vertical-align: middle;
+  }
   .pager { display: flex; align-items: center; justify-content: space-between;
            gap: 12px; padding-top: 14px; margin-top: 4px; flex-wrap: wrap;
            font-size: 13px; border-top: 1px solid var(--outline-soft); }
@@ -379,9 +404,11 @@
 const BAN_LINE = 80;
 
 const api = async (path, opts = {}) => {
-  const r = await fetch(path, { credentials: 'include', ...opts,
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  const { requireSuccess = false, ...fetchOpts } = opts;
+  const r = await fetch(path, { credentials: 'include', ...fetchOpts,
+    headers: { 'Content-Type': 'application/json', ...(fetchOpts.headers || {}) } });
   if (r.status === 401) { renderLogin(); throw new Error('unauthorized'); }
+  if (requireSuccess && (r.status < 200 || r.status >= 300)) throw new Error('请求失败');
   return r.json();
 };
 
@@ -582,11 +609,18 @@ const pages = {
   },
 
   proxies: async () => {
-    const data = await api('api/proxies');
+    const [data, acctsData] = await Promise.all([
+      api('api/proxies'),
+      api('api/accounts').catch(() => ({ items: [] })),
+    ]);
     return `
       <div class="panel page-fill">
         <h2>代理池
-          <span class="controls"><button class="btn" onclick="addProxy()">+ 添加代理</button></span>
+          <span class="controls"><button class="btn muted" id="probeAllProxiesBtn" onclick="probeAllProxies(this)">一键测试全部代理</button>
+            <button class="btn muted" id="autoBindProxiesBtn" onclick="autoBindBestProxies(this)">智能最优绑定</button>
+            <button class="btn muted" id="importClashPortsBtn" onclick="importClashPorts(this)">一键导入 Clash 节点池</button>
+            <button class="btn danger" id="delFailedProxiesBtn" onclick="deleteUnavailableProxies(this)">清理不可用代理</button>
+            <button class="btn" onclick="addProxy()">+ 添加代理</button></span>
         </h2>
         <details class="note">
           <summary>每个代理是一个独立 IP slot</summary>
@@ -603,30 +637,41 @@ const pages = {
         <div class="table-scroll">
           <table>
             <colgroup>
-              <col style="width:56px"><col style="width:150px"><col>
-              <col style="width:88px"><col style="width:80px"><col style="width:200px">
-              <col style="width:186px">
+              <col style="width:56px"><col style="width:140px"><col>
+              <col style="width:88px"><col style="width:160px"><col style="width:70px"><col style="width:180px">
+              <col style="width:230px">
             </colgroup>
             <thead><tr>
               <th class="nw">ID</th><th class="nw">名称</th><th>代理 URL</th><th class="nw">状态</th>
-              <th class="nw">失败</th><th class="nw">最近错误</th><th class="nw">操作</th>
+              <th class="nw">绑定账号</th><th class="nw">失败</th><th class="nw">最近错误</th><th class="nw">操作</th>
             </tr></thead>
-            <tbody>${(data.items || []).map(p => `
+            <tbody>${(data.items || []).map(p => {
+              const probe = (window.lastProxyProbeResults || {})[p.id];
+              return `
               <tr>
                 <td class="num nw">${p.id}</td>
                 <td class="truncate" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</td>
                 <td class="pre truncate" title="${escapeHtml(p.url)}">${escapeHtml(p.url)}</td>
-                <td class="nw">${p.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge muted">已禁用</span>'}</td>
+                <td class="nw">${!p.enabled ? '<span class="badge muted">已禁用</span>' :
+                  (probe ? (probe.ok ? `<span class="badge ok" title="HTTP ${probe.status}">${probe.latency_ms}ms</span>` : `<span class="badge fail" title="${escapeHtml(probe.error || '')}">不可用</span>`) :
+                  '<span class="badge ok">已启用</span>')}</td>
+                <td class="nw">${(() => {
+                  const bound = (acctsData.items || []).filter(a => a.proxy_id === p.id);
+                  if (!bound.length) return '<span class="muted" style="font-size:12px">—</span>';
+                  return bound.map(a => `<span class="badge" title="${escapeHtml(a.email || a.label || '')}" style="font-size:11px;margin-right:4px">#${a.id} ${escapeHtml(a.email || a.label || '账号')}</span>`).join('');
+                })()}</td>
                 <td class="num nw">${p.fail_count > 0 ? '<span class="badge fail">' + p.fail_count + '</span>' : p.fail_count}</td>
-                <td class="pre truncate" title="${escapeHtml(t(p.last_error || ''))}">${escapeHtml(t(p.last_error) || '—')}</td>
+                <td class="pre truncate" title="${escapeHtml(t(probe?.error || p.last_error || ''))}">${escapeHtml(t(probe?.error || p.last_error) || '—')}</td>
                 <td class="nw">
                   <span class="actions">
+                    <button class="btn muted" onclick="assignProxyAccounts(${p.id}, ${JSON.stringify(p.name).replace(/"/g, '&quot;')})">换绑账号</button>
                     <button class="btn muted" onclick="toggleProxy(${p.id})">${p.enabled ? '禁用' : '启用'}</button>
                     <button class="btn muted" onclick="resetProxy(${p.id})">重置</button>
                     <button class="btn danger" onclick="delProxy(${p.id})">删除</button>
                   </span>
                 </td>
-              </tr>`).join('') || '<tr><td colspan="7" class="empty">还没有代理。点「+ 添加代理」加一个。</td></tr>'}
+              </tr>`;
+            }).join('') || '<tr><td colspan="8" class="empty">还没有代理。点「+ 添加代理」加一个。</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -635,70 +680,104 @@ const pages = {
   },
 
   cookies: async () => {
-    const data = await api('api/cookies');
+    const data = await api('api/accounts', { requireSuccess: true });
+    if (data.error) throw new Error(data.error);
     const items = data.items || [];
     const deadN = items.filter(a => a.health === 'dead').length;
     return `
       <div class="panel page-fill">
-        <h2>Cookie 池
+        <h2>账号池
           <span class="controls">
-            ${deadN > 0 ? '<span class="badge fail" style="margin-right:8px" title="' + t('这些号鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出') + '">' + deadN + ' ' + t('疑似失效') + '</span>' : ''}
+            <button class="btn muted" onclick="selectBrowserAccount(0)" ${data.account_id === 0 ? 'disabled' : ''}>${data.account_id === 0 ? '自动选号中' : '切换为自动选号'}</button>
             <span class="badge ${data.enabled > 0 ? 'ok' : 'muted'}" style="margin-right:8px">${LANG === 'en' ? (data.enabled || 0) + ' active / ' + (data.total || 0) + ' total' : (data.enabled || 0) + ' 启用 / ' + (data.total || 0) + ' 共'}</span>
-            <button class="btn" onclick="addCookieAcct()">+ 导入 Cookie</button>
+            <button class="btn muted" onclick="refreshPage()">一键刷新</button>
+            <button class="btn muted" id="refreshAllQuotaBtn" onclick="refreshAllQuotas(this)">一键刷新额度</button>
+            <button class="btn muted" onclick="autoBindBestProxies(this)">智能最优绑定</button>
+            <button class="btn muted" onclick="batchSetAllAccounts('enabled')">一键全开</button>
+            <button class="btn muted" onclick="batchSetAllAccounts('disabled')">一键全关</button>
+            <button class="btn" onclick="addBrowserAccount()">+ 添加账号</button>
+            <button class="btn muted" onclick="addCookieAcct()">导入 Cookie</button>
           </span>
         </h2>
+        <div class="account-summary">
+          <span class="badge muted">${data.ready ?? 0} ${t('登录就绪')}</span>
+          <span class="badge ${(data.pool_ready ?? 0) > 0 ? 'ok' : 'muted'}">${data.pool_ready ?? 0} ${t('可选号')}</span>
+          <span class="badge ${(data.quota_limited ?? 0) > 0 ? 'fail' : 'muted'}">${data.quota_limited ?? 0} ${t('已限额')}</span>
+        </div>
+        <div id="accountBatchBar" class="account-batch-bar" style="display:none">
+          <span id="accountBatchCount" style="font-size:13px;font-weight:500">已选择 0 个账号</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn" style="padding:4px 12px;font-size:12.5px" onclick="batchSetSelectedAccounts('enabled')">批量启用</button>
+            <button class="btn muted" style="padding:4px 12px;font-size:12.5px" onclick="batchSetSelectedAccounts('disabled')">批量关闭</button>
+            <button class="btn muted" style="padding:4px 12px;font-size:12.5px" onclick="autoBindBestProxies(this, getSelectedAccountIds())">智能最优绑定</button>
+            <button class="btn muted" style="padding:4px 12px;font-size:12.5px" onclick="batchChangeSelectedProxies()">换绑代理</button>
+            <button class="btn muted" style="padding:4px 10px;font-size:12.5px" onclick="clearSelectedAccounts()">取消选择</button>
+          </div>
+        </div>
+        ${items.some(a => a.selected && a.quota?.state === 'limited') ? `<div class="fixed-quota-warning">${t('固定账号已限额；当前选择保留，请等待网页确认恢复或手动切换。')}</div>` : ''}
         <details class="note">
-          <summary>每行一个 Google 登录态账号</summary>
+          <summary>登录一次，后续自动切换和维护登录态</summary>
           <div class="body">
-            粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID /
-            APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个
-            启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
-            凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 /
-            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄，
-            首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出
-            （Chrome 新版本的设备绑定会话续不了）。
+            添加账号后，在独立浏览器窗口里完成 Google 登录，再点击「完成登录」。
+            每个账号保存自己的浏览器档案，正常生成在后台运行，Cookie 自动维护。<br><br>
+            自动选号使用已启用且登录有效的账号；也可点击「使用此账号」固定选择。
+            已开始的对话和视频继续使用原账号。登录失效时点击「重新登录」。
+            原有 Cookie 账号可以继续使用，也可点击「登录」绑定独立浏览器档案。
           </div>
         </details>
         <div class="table-scroll">
-          <table>
+          <table class="account-table">
             <colgroup>
-              <col style="width:48px"><col style="width:160px"><col style="width:80px">
-              <col style="width:150px"><col style="width:92px"><col style="width:64px">
-              <col style="width:150px"><col><col style="width:150px">
+              <col style="width:38px"><col style="width:48px"><col style="width:200px"><col style="width:105px">
+              <col style="width:100px"><col style="width:130px"><col style="width:64px">
+              <col style="width:240px"><col style="width:230px">
+              <col style="width:150px"><col><col style="width:310px">
             </colgroup>
             <thead><tr>
-              <th class="nw">ID</th><th class="nw">标签</th><th class="nw">状态</th>
-              <th class="nw">关键 Cookie</th><th class="nw">SAPISID</th><th class="nw">失败</th>
+              <th class="nw" style="text-align:center"><input type="checkbox" id="selectAllAccounts" onchange="toggleSelectAllAccounts(this.checked)" title="全选 / 取消全选"></th>
+              <th class="nw">ID</th><th class="nw">账号</th><th class="nw">登录状态</th>
+              <th class="nw">会话</th><th class="nw">出口</th><th class="nw">失败</th>
+              <th class="nw">网页额度（已用 / 剩余）</th><th class="nw">额度状态 / 恢复确认</th>
               <th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
             </tr></thead>
             <tbody>${items.map(a => `
-              <tr class="${a.health === 'dead' ? 'row-dead' : ''}">
+              <tr class="${a.health === 'dead' ? 'row-dead' : ''}" data-account-selected="${a.selected ? 'true' : 'false'}">
+                <td class="nw" style="text-align:center"><input type="checkbox" class="acct-cb" value="${a.id}" onchange="updateAccountBatchBar()"></td>
                 <td class="num nw">${a.id}</td>
-                <td class="truncate" title="${escapeHtml(a.label || '')}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}</td>
+                <td title="${escapeHtml(a.email || a.label || '')}">${escapeHtml(a.email || a.label || '未命名')}<div class="muted" style="font-size:12px;margin-top:4px">${a.email && a.label ? escapeHtml(a.label) : ''}${a.selected ? ' · 当前使用' : ''}</div></td>
                 <td class="nw">${
-                  a.health === 'dead' ? '<span class="badge fail" title="鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">疑似失效</span>'
-                  : a.health === 'disabled' ? '<span class="badge muted">禁用</span>'
+                  a.status !== 'enabled' ? '<span class="badge muted">禁用</span>'
+                  : a.login_state === 'needs_login' ? '<span class="badge warn">需登录</span>'
+                  : a.login_state === 'logging_in' ? '<span class="badge warn">等待登录确认</span>'
+                  : a.login_state === 'ready' ? '<span class="badge ok">已登录</span>'
+                  : a.health === 'dead' ? '<span class="badge fail">疑似失效</span>'
                   : a.health === 'unknown' ? '<span class="badge warn" title="还没成功用过，点「检测」确认">待检测</span>'
                   : '<span class="badge ok">正常</span>'
                 }</td>
                 <td class="nw" title="${LANG === 'en' ? 'Total ' + a.cookie_count + ' cookies, key items: ' + (a.key_cookies||[]).join(' / ') : '共 ' + a.cookie_count + ' 个 cookie，关键项：' + (a.key_cookies||[]).join(' / ')}">
                   <span class="badge ${a.has_1psidts ? 'ok' : 'warn'}">${(a.key_cookies||[]).length}/9 项</span>
-                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出">缺 TS</span>'}
+                  <div class="muted" style="font-size:12px;margin-top:4px">${a.profile_id ? '独立档案' : 'Cookie 导入'}</div>
                 </td>
-                <td class="pre nw">${a.sapisid_tail ? '…' + escapeHtml(a.sapisid_tail) : '—'}</td>
+                <td class="nw">${escapeHtml(a.proxy_name || '直连')}</td>
                 <td class="num nw">${a.fail_count > 0 ? '<span class="badge fail">' + a.fail_count + '</span>' : 0}</td>
+                <td class="quota-cell">${renderAccountQuota(a)}</td>
+                <td class="quota-detail">${renderQuotaStatus(a)}</td>
                 <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
                 <td class="pre truncate" title="${escapeHtml(t(a.last_error || ''))}">${escapeHtml(t(a.last_error) || '—')}</td>
                 <td class="nw">
                   <span class="actions">
-                    <button class="btn muted" onclick="checkCookieAcct(${a.id}, this)">检测</button>
-                    <button class="btn muted" onclick="rotateCookieAcct(${a.id}, this)">保活</button>
+                    <button class="btn muted" onclick="browserAccountAction(${a.id}, 'login', this)">${a.email ? '重新登录' : '登录'}</button>
+                    ${a.login_state === 'logging_in' || a.login_state === 'needs_login' ? `<button class="btn" onclick="browserAccountAction(${a.id}, 'confirm-login', this)">完成登录</button>` : ''}
+                    ${a.profile_id ? `<button class="btn muted" onclick="browserAccountAction(${a.id}, 'refresh', this)">刷新</button><button class="btn muted" onclick="browserAccountAction(${a.id}, 'open', this)">打开窗口</button>` : `<button class="btn muted" onclick="checkCookieAcct(${a.id}, this)">检测</button><button class="btn muted" onclick="rotateCookieAcct(${a.id}, this)">保活</button>`}
+                    <button class="btn muted" data-quota-refresh="${a.id}" onclick="refreshAccountQuota(${a.id}, this)" ${quotaRefreshPending.has(a.id) ? 'disabled' : ''}>${t(quotaRefreshPending.has(a.id) ? '额度读取中…' : '刷新额度')}</button>
+                    ${a.status === 'enabled' && (a.login_state === 'ready' || a.login_state === 'cookie_only') ? `<button class="btn muted" data-account-select="${a.id}" onclick="selectBrowserAccount(${a.id})" ${a.selected || a.quota?.eligible === false ? 'disabled' : ''}>${a.selected ? '当前使用' : '使用此账号'}</button>` : ''}
                     <button class="btn muted" onclick="toggleCookieAcct(${a.id})">${a.status === 'enabled' ? '禁用' : '启用'}</button>
+                    <button class="btn muted" onclick="changeAccountProxy(${a.id}, ${a.proxy_id || 0}, ${JSON.stringify(a.email || a.label || ('#' + a.id)).replace(/"/g, '&quot;')})">换绑代理</button>
                     <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')})">编辑</button>
-                    <button class="btn danger" onclick="delCookieAcct(${a.id})">删除</button>
+                    <button class="btn danger" onclick="deleteBrowserAccount(${a.id})">删除</button>
                   </span>
                 </td>
-              </tr>`).join('') || '<tr><td colspan="9" class="empty">Cookie 池是空的。点「+ 导入 Cookie」加一个登录态账号。</td></tr>'}
+              </tr>`).join('') || '<tr><td colspan="12" class="empty">还没有账号。点击「+ 添加账号」完成网页登录。</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -958,6 +1037,12 @@ const RT_GROUPS = [
         hint: '走 Gemini 原生服务端多轮：按历史前缀认出这是上一轮的续接，命中就只发最新一句、历史留在服务端，同一串对话复用同一个 gemini 会话（不再每发一条就新开一个）。匿名/登录都行，带图或带工具时不生效。首轮/重启/改历史会退回整段重发。默认关' },
       { k: 'anon_first', label: '匿名优先', type: 'bool',
         hint: '这次请求不需要登录态能力时（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号（默认关）' },
+      { k: 'account_strategy', label: '账号轮换策略', type: 'select',
+        options: [
+          { v: 'sticky', l: '单号粘性（额度用完或异常再换号）' },
+          { v: 'round_robin', l: '轮询轮转（每个请求换一个号）' }
+        ],
+        hint: 'sticky：保持使用同一个账号，直到额度耗尽（限额）或请求异常才切换下一个，保障上下文连贯性；round_robin：每个请求轮询下一个账号（默认 sticky）' },
     ],
   },
   {
@@ -997,8 +1082,9 @@ async function loadRtCfg() {
           if (f.type === 'bool') {
             input = `<input type="checkbox" id="rt_${f.k}" ${v ? 'checked' : ''}>`;
           } else if (f.type === 'select') {
-            input = `<select id="rt_${f.k}">` + rtModels.map(m =>
-              `<option value="${escapeHtml(m)}" ${m === v ? 'selected' : ''}>${escapeHtml(m)}</option>`
+            const opts = f.options || rtModels.map(m => ({ v: m, l: m }));
+            input = `<select id="rt_${f.k}">` + opts.map(o =>
+              `<option value="${escapeHtml(o.v)}" ${o.v === v ? 'selected' : ''}>${escapeHtml(o.l)}</option>`
             ).join('') + '</select>';
           } else if (f.type === 'int') {
             input = `<input type="number" id="rt_${f.k}" value="${v}" min="${f.min}" max="${f.max}">`;
@@ -1144,6 +1230,151 @@ async function resetProxy(id) {
   await refreshPage();
 }
 // Cookie 池 ────────────────────────────────────────────────────────────────
+
+const quotaRefreshPending = new Set();
+let quotaCountdownTimer = null;
+
+function quotaPercent(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return t('未知');
+  if (value > 0 && value < 0.01) return '<0.01%';
+  if (value < 100 && value > 99.99) return '>99.99%';
+  if (value > 100 && value < 100.01) return '>100%';
+  return Number(value.toFixed(2)) + '%';
+}
+
+function quotaTime(value, kind) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return t('未知');
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return t('未知');
+  return `<time data-time="${kind}" datetime="${date.toISOString()}">${escapeHtml(fmt.ts(value))}</time>`;
+}
+
+function renderAccountQuota(account) {
+  const q = account.quota || {};
+  const window = (key, label, used, reset, kind) => {
+    const known = typeof used === 'number' && Number.isFinite(used) && used >= 0;
+    const remaining = known ? Math.max(100 - used, 0) : null;
+    return `<div class="quota-window ${known && used >= 100 ? 'exhausted' : ''}" data-window="${key}">
+      <div class="quota-values"><span>${t(label)}</span> <b class="quota-used" title="${known ? used + '%' : t('未知')}">${escapeHtml(quotaPercent(used))}</b> <span>/ ${t('剩余')}</span> <b class="quota-remaining">${escapeHtml(quotaPercent(remaining))}</b></div>
+      ${known ? `<progress max="100" value="${Math.min(used, 100)}" aria-label="${t(label)}"></progress>` : ''}
+      <div class="quota-meta">${t('网页重置')}：${quotaTime(reset, kind)}</div>
+    </div>`;
+  };
+  return `${q.error ? `<div class="quota-meta">${t('上次或局部数据；读取未完成')}</div>` : ''}
+    ${!account.profile_id ? `<div class="quota-meta">${t('Cookie 账号：网页额度未知')}</div>` : ''}
+    ${window('five-hour', '5小时已用', q.used_percent, q.reset_at, 'five-reset')}
+    ${window('weekly', '周额度已用', q.weekly_used_percent, q.weekly_reset_at, 'week-reset')}
+    <div class="quota-meta">${t('本机时间')}</div>`;
+}
+
+function quotaCountdown(deadline) {
+  if (!deadline) return t('恢复时间未知，等待网页确认');
+  const left = Math.ceil(deadline - Date.now() / 1000);
+  if (left <= 0) return t('已到期，等待网页确认');
+  const days = Math.floor(left / 86400);
+  const clock = [Math.floor(left % 86400 / 3600), Math.floor(left % 3600 / 60), left % 60].map(n => String(n).padStart(2, '0')).join(':');
+  return `${days ? days + ' ' + t('天') + ' ' : ''}${clock} · ${t('到时仍需网页确认')}`;
+}
+
+function renderQuotaStatus(account) {
+  const q = account.quota || {};
+  const limited = q.state === 'limited';
+  const label = limited ? ({ five_hour: '5小时额度已耗尽', weekly: '周额度已耗尽', both: '两窗口额度已耗尽' }[q.limited_by] || '已限额') : q.state === 'available' ? '额度可用' : '额度未知，按账号原资格';
+  return `<div class="quota-status" data-state="${q.state || 'unknown'}"><span class="badge ${limited ? 'fail' : q.state === 'available' ? 'ok' : 'muted'}">${t(label)}</span></div>
+    <div class="quota-meta">${t(q.eligible === true ? '可选号' : '当前不可选号')}</div>
+    ${limited ? `<div>${t('恢复确认时间')}：${quotaTime(q.blocked_until, 'blocked-until')} <span class="quota-meta">(${t('本机时间')})</span></div><div class="quota-countdown" data-deadline="${q.blocked_until || ''}">${quotaCountdown(q.blocked_until)}</div>` : ''}
+    <div class="quota-meta">${t('最近检查')}：${quotaTime(q.checked_at, 'checked')} <span>(${t('本机时间')})</span></div>
+    ${q.error ? `<div class="quota-error">${t('读取错误')}：${escapeHtml(t(q.error))}</div>` : ''}`;
+}
+
+function stopQuotaCountdown() {
+  if (quotaCountdownTimer !== null) clearInterval(quotaCountdownTimer);
+  quotaCountdownTimer = null;
+}
+
+function startQuotaCountdown() {
+  stopQuotaCountdown();
+  // 页面挂载后才建立计时器；兼容既有无浏览器全局对象的脚本验证环境。
+  if (typeof window === 'undefined' || currentPage !== 'cookies') return;
+  quotaCountdownTimer = setInterval(() => {
+    document.querySelectorAll('.quota-countdown').forEach(el => {
+      el.textContent = quotaCountdown(Number(el.dataset.deadline) || null);
+    });
+  }, 1000);
+}
+
+async function refreshAccountQuota(id, button) {
+  if (quotaRefreshPending.has(id)) return;
+  quotaRefreshPending.add(id);
+  if (button) { button.disabled = true; button.textContent = t('额度读取中…'); }
+  try {
+    const result = await api(`api/accounts/${id}/quota`, { method: 'POST' });
+    // 其他账号刷新或语言切换可替换整张表，按账号定位当前页面的有效行。
+    const row = currentPage === 'cookies' ? document.getElementById('main')?.querySelector(`[data-quota-refresh="${id}"]`)?.closest('tr') : null;
+    if (result.account && row?.isConnected) {
+      row.querySelector('.quota-cell').innerHTML = renderAccountQuota(result.account);
+      row.querySelector('.quota-detail').innerHTML = renderQuotaStatus(result.account);
+      row.dataset.accountSelected = result.account.selected ? 'true' : 'false';
+      const select = row.querySelector('[data-account-select]');
+      if (select) {
+        select.disabled = result.account.selected || result.account.quota?.eligible === false;
+        select.textContent = t(result.account.selected ? '当前使用' : '使用此账号');
+      }
+      const main = row.closest('main');
+      const warning = main.querySelector('.fixed-quota-warning');
+      if (main.querySelector('tr[data-account-selected="true"] .quota-status[data-state="limited"]')) {
+        if (!warning) main.querySelector('.account-summary').insertAdjacentHTML('afterend', `<div class="fixed-quota-warning">${t('固定账号已限额；当前选择保留，请等待网页确认恢复或手动切换。')}</div>`);
+      } else if (warning) warning.remove();
+    }
+    flash(result.error ? t('额度读取未完成') + '：' + t(result.error) : '额度已更新');
+    // 409 也携带最新局部观测；重新读取列表以同步可选号和限额统计。
+    if (currentPage === 'cookies') await refreshPage({ preserveView: true });
+  } catch (error) {
+    flash(t('额度刷新失败；保留上次状态'));
+    const cell = currentPage === 'cookies' ? document.getElementById('main')?.querySelector(`[data-quota-refresh="${id}"]`)?.closest('tr')?.querySelector('.quota-cell') : null;
+    if (cell && !cell.querySelector('.quota-read-failed')) cell.insertAdjacentHTML('afterbegin', `<div class="quota-read-failed quota-meta">${t('上次数据；本次读取失败')}</div>`);
+  } finally {
+    quotaRefreshPending.delete(id);
+    if (button) { button.disabled = false; button.textContent = t('刷新额度'); }
+    document.querySelectorAll(`[data-quota-refresh="${id}"]`).forEach(el => { el.disabled = false; el.textContent = t('刷新额度'); });
+  }
+}
+
+async function addBrowserAccount() {
+  const data = await modalForm({ title: '添加账号', desc: '账号将在独立浏览器中登录，无需填写密码或复制 Cookie。', submitText: '添加并登录', fields: [
+    { name: 'label', label: '标签', placeholder: '便于识别，可留空' },
+    { name: 'note', label: '备注', placeholder: '可留空' },
+  ] });
+  if (!data) return;
+  const result = await api('api/accounts', { method: 'POST', body: JSON.stringify(data) });
+  if (result.error) return flash(result.error);
+  await browserAccountAction(result.id, 'login');
+}
+
+async function browserAccountAction(id, action, button) {
+  if (button) button.disabled = true;
+  try {
+    const result = await api(`api/accounts/${id}/${action}`, { method: 'POST' });
+    if (result.error) flash(result.error);
+    else flash(action === 'login' || action === 'open' ? '在浏览器中完成登录后，点击「完成登录」。' : '账号登录态已更新');
+    await refreshPage();
+  } catch (error) { flash(error.message); }
+  finally { if (button) button.disabled = false; }
+}
+
+async function selectBrowserAccount(id) {
+  const result = await api('api/accounts/selection', { method: 'PUT', body: JSON.stringify({ account_id: id }) });
+  if (result.error) return flash(result.error);
+  flash(id ? '后续新请求使用此账号' : '后续新请求自动选号');
+  await refreshPage();
+}
+
+async function deleteBrowserAccount(id) {
+  if (!await modalConfirm({ title: '删除账号 #' + id, desc: '删除账号记录并关闭其空闲浏览器；本地档案保留。', confirmText: '删除' })) return;
+  const result = await api('api/accounts/' + id, { method: 'DELETE' });
+  if (result.error) return flash(result.error);
+  await refreshPage();
+}
 
 // 逐项模式列出的 cookie。顺序按"从 DevTools 里找的难易"排，不是字母序。
 // req 只标 SAPISID：后端也只强制这一项（要用它算 SAPISIDHASH 授权头），
@@ -1301,16 +1532,22 @@ async function addCookieAcct() {
 
 async function editCookieAcct(id, label, note) {
   const data = await modalForm({
-    title: '编辑 Cookie #' + id,
-    desc: '只改标签和备注，不动 cookie 本身。要换 cookie 请删掉重新导入。',
+    title: '编辑账号 #' + id,
+    desc: '修改标签、备注和出口。已有绑定优先使用；0 自动选择出口。浏览器档案保留；登录失效时使用「重新登录」。',
     fields: [
       { name: 'label', label: '标签', value: label || '', placeholder: '账号邮箱' },
       { name: 'note', label: '备注', value: note || '', placeholder: '可留空' },
+      { name: 'proxy_id', label: '出口编号', placeholder: '留空保持当前出口，0 自动选择出口' },
     ],
   });
   if (!data) return;
-  const j = await api('api/cookies/' + id, {
-    method: 'PATCH', body: JSON.stringify({ label: data.label, note: data.note }),
+  const change = { label: data.label, note: data.note };
+  if (data.proxy_id !== '') {
+    if (!/^\d+$/.test(data.proxy_id)) return flash('出口编号必须是非负整数');
+    change.proxy_id = Number(data.proxy_id);
+  }
+  const j = await api('api/accounts/' + id, {
+    method: 'PATCH', body: JSON.stringify(change),
   });
   if (j.error) return flash(t('保存失败：') + t(j.error));
   flash(t('已保存'));
@@ -1352,8 +1589,399 @@ async function rotateCookieAcct(id, btn) {
 }
 
 async function toggleCookieAcct(id) {
-  await api('api/cookies/' + id + '/toggle', { method: 'POST' });
+  const a = await api('api/accounts/' + id);
+  const result = await api('api/accounts/' + id, { method: 'PATCH', body: JSON.stringify({ status: a.status === 'enabled' ? 'disabled' : 'enabled' }) });
+  if (result.error) return flash(result.error);
   await refreshPage();
+}
+
+function getSelectedAccountIDs() {
+  return Array.from(document.querySelectorAll('.acct-cb:checked')).map(cb => parseInt(cb.value, 10)).filter(Boolean);
+}
+
+function updateAccountBatchBar() {
+  const cbs = Array.from(document.querySelectorAll('.acct-cb'));
+  const checked = cbs.filter(cb => cb.checked);
+  const bar = document.getElementById('accountBatchBar');
+  const countSpan = document.getElementById('accountBatchCount');
+  const selectAll = document.getElementById('selectAllAccounts');
+
+  if (selectAll) {
+    selectAll.checked = cbs.length > 0 && checked.length === cbs.length;
+    selectAll.indeterminate = checked.length > 0 && checked.length < cbs.length;
+  }
+  if (bar) {
+    if (checked.length > 0) {
+      bar.style.display = 'flex';
+      if (countSpan) {
+        countSpan.textContent = t(`已选择 ${checked.length} 个账号`);
+      }
+    } else {
+      bar.style.display = 'none';
+    }
+  }
+}
+
+function toggleSelectAllAccounts(checked) {
+  document.querySelectorAll('.acct-cb').forEach(cb => { cb.checked = checked; });
+  updateAccountBatchBar();
+}
+
+function clearSelectedAccounts() {
+  document.querySelectorAll('.acct-cb').forEach(cb => { cb.checked = false; });
+  const selectAll = document.getElementById('selectAllAccounts');
+  if (selectAll) { selectAll.checked = false; selectAll.indeterminate = false; }
+  updateAccountBatchBar();
+}
+
+async function batchSetSelectedAccounts(status) {
+  const ids = getSelectedAccountIDs();
+  if (ids.length === 0) return flash(t('未选择任何账号'));
+  const isEnable = status === 'enabled';
+  const actionText = isEnable ? t('批量启用') : t('批量关闭');
+  const desc = isEnable ? t(`确定批量启用选中的 ${ids.length} 个账号？`) : t(`确定批量关闭选中的 ${ids.length} 个账号？`);
+  const ok = await modalConfirm({
+    title: actionText,
+    desc,
+    confirmText: isEnable ? t('全部启用') : t('全部禁用'),
+    danger: !isEnable,
+  });
+  if (!ok) return;
+  const result = await api('api/accounts', {
+    method: 'PATCH',
+    body: JSON.stringify({ ids, status }),
+  });
+  if (result.error) return flash(result.error);
+  flash((isEnable ? '✓ ' : '') + t(`已更新，当前启用 ${result.enabled ?? 0}/${result.total ?? 0}`));
+  await refreshPage();
+}
+
+async function batchSetAllAccounts(status) {
+  const isEnable = status === 'enabled';
+  const title = isEnable ? t('一键全开') : t('一键全关');
+  const desc = isEnable
+    ? t('确定启用账号池中的所有账号？')
+    : t('确定禁用账号池中的所有账号？禁用后请求将无法通过账号池分发。');
+  const ok = await modalConfirm({
+    title,
+    desc,
+    confirmText: isEnable ? t('全部启用') : t('全部禁用'),
+    danger: !isEnable,
+  });
+  if (!ok) return;
+  const result = await api('api/accounts', {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  });
+  if (result.error) return flash(result.error);
+  flash((isEnable ? '✓ ' : '') + t(`全部账号已更新：当前启用 ${result.enabled ?? 0}/${result.total ?? 0}`));
+  await refreshPage();
+}
+
+async function refreshAllQuotas(button) {
+  const ids = Array.from(document.querySelectorAll('.acct-cb')).map(cb => parseInt(cb.value, 10)).filter(Boolean);
+  if (!ids.length) return flash(t('暂无可刷新的账号'));
+  const oldText = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = t('刷新中…'); }
+  try {
+    let done = 0;
+    for (const id of ids) {
+      if (button) button.textContent = t(`刷新中 (${done}/${ids.length})`);
+      await refreshAccountQuota(id).catch(() => {});
+      done++;
+    }
+    flash(t(`一键刷新额度完成，已检查 ${done} 个账号`));
+  } finally {
+    if (button) { button.disabled = false; button.textContent = oldText; }
+    if (currentPage === 'cookies') await refreshPage({ preserveView: true });
+  }
+}
+
+async function changeAccountProxy(acctId, currentProxyId, acctName) {
+  let proxies = [];
+  try {
+    const data = await api('api/proxies');
+    proxies = (data.items || []).filter(p => p.enabled);
+  } catch (e) {}
+
+  const optionsHtml = [
+    `<option value="0" ${currentProxyId === 0 ? 'selected' : ''}>${t('直连 / 自动选择出口')}</option>`,
+    ...proxies.map(p => `<option value="${p.id}" ${p.id === currentProxyId ? 'selected' : ''}>#${p.id} ${escapeHtml(p.name)} (${escapeHtml(p.url)})</option>`)
+  ].join('');
+
+  const bodyHTML = `
+    <div class="field">
+      <label>${t('选择代理节点')}</label>
+      <select id="bindProxySelect" style="width:100%;padding:8px 10px;border-radius:var(--r-card);border:1px solid var(--outline-soft);background:var(--bg);color:var(--text);font-size:13px">
+        ${optionsHtml}
+      </select>
+      <div class="hint" style="margin-top:6px;font-size:12px;color:var(--muted)">${t('设置后该账号请求将固定走此代理出口。选择「直连 / 自动选择出口」则根据系统规则调度。')}</div>
+    </div>
+  `;
+
+  const ok = await buildModal({
+    title: t(`换绑代理 - 账号 #${acctId}`),
+    desc: t(`为账号 ${acctName} 指定专用代理出口`),
+    bodyHTML,
+    submitText: t('确定换绑'),
+    onSubmit: async (overlay) => {
+      const sel = overlay.querySelector('#bindProxySelect');
+      const pid = parseInt(sel.value, 10);
+      const res = await api(`api/accounts/${acctId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ proxy_id: pid })
+      });
+      if (res.error) return { error: res.error };
+      return true;
+    }
+  });
+
+  if (ok === true) {
+    flash(t('代理绑定已更新'));
+    await refreshPage();
+  }
+}
+
+async function batchChangeSelectedProxies() {
+  const ids = getSelectedAccountIDs();
+  if (!ids.length) return flash(t('未选择任何账号'));
+
+  let proxies = [];
+  try {
+    const data = await api('api/proxies');
+    proxies = (data.items || []).filter(p => p.enabled);
+  } catch (e) {}
+
+  const optionsHtml = [
+    `<option value="0">${t('直连 / 自动选择出口')}</option>`,
+    ...proxies.map(p => `<option value="${p.id}">#${p.id} ${escapeHtml(p.name)} (${escapeHtml(p.url)})</option>`)
+  ].join('');
+
+  const bodyHTML = `
+    <div class="field">
+      <label>${t('选择目标代理节点')}</label>
+      <select id="batchProxySelect" style="width:100%;padding:8px 10px;border-radius:var(--r-card);border:1px solid var(--outline-soft);background:var(--bg);color:var(--text);font-size:13px">
+        ${optionsHtml}
+      </select>
+      <div class="hint" style="margin-top:6px;font-size:12px;color:var(--muted)">${t(`将为选中的 ${ids.length} 个账号统一更换/绑定为此代理节点。`)}</div>
+    </div>
+  `;
+
+  const ok = await buildModal({
+    title: t('批量换绑代理'),
+    desc: t(`确定批量为选中的 ${ids.length} 个账号更换绑定的代理？`),
+    bodyHTML,
+    submitText: t('确认批量换绑'),
+    onSubmit: async (overlay) => {
+      const sel = overlay.querySelector('#batchProxySelect');
+      const pid = parseInt(sel.value, 10);
+      const res = await api('api/accounts', {
+        method: 'PATCH',
+        body: JSON.stringify({ ids, proxy_id: pid })
+      });
+      if (res.error) return { error: res.error };
+      return true;
+    }
+  });
+
+  if (ok === true) {
+    flash(t('批量更换代理完成'));
+    await refreshPage();
+  }
+}
+
+async function probeAllProxies(btn) {
+  const origText = btn ? btn.innerText : '';
+  if (btn) { btn.disabled = true; btn.innerText = t('测速检测中...'); }
+  try {
+    const res = await api('api/proxies/probe', { method: 'POST' });
+    const items = res.items || [];
+    window.lastProxyProbeResults = window.lastProxyProbeResults || {};
+    items.forEach(x => { window.lastProxyProbeResults[x.id] = x; });
+    const okCount = items.filter(x => x.ok).length;
+    await refreshPage();
+    const badItems = items.filter(x => !x.ok);
+    if (badItems.length > 0) {
+      flash(`测试完成：${okCount}/${items.length} 个节点满足 Gemini 限制且可用；${badItems.length} 个不可用`);
+      setTimeout(async () => {
+        if (confirm(t(`测试完成：检测到 ${badItems.length} 个不可用节点，是否立即清理删除？`))) {
+          await deleteUnavailableProxies(null, badItems.map(x => x.id));
+        }
+      }, 400);
+    } else {
+      flash(`测试完成：全部 ${items.length} 个节点满足 Gemini 限制且可用`);
+    }
+  } catch (err) {
+    alert(t('测试失败: ') + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerText = origText; }
+  }
+}
+
+
+async function importClashPorts(btn) {
+  const ok = await modalConfirm({
+    title: t('一键导入 Clash 全部可用节点池'),
+    desc: t('系统将直接读取本地 Clash Verge 的全部节点监听配置，一键导入全部可用节点（包含主出口与全部独立分流出口）。确定导入？'),
+    confirmText: t('确认导入'),
+  });
+  if (!ok) return;
+
+  const origText = btn ? btn.innerText : '';
+  if (btn) { btn.disabled = true; btn.innerText = t('导入中...'); }
+  try {
+    const res = await api('api/proxies/import-clash', { method: 'POST' });
+    if (res.error) throw new Error(res.error);
+    flash(t(`导入完成：已成功导入 ${res.imported ?? 0} 个新节点（当前节点池共 ${res.total ?? 0} 个）`));
+    await refreshPage();
+  } catch (err) {
+    alert(t('导入失败: ') + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerText = origText; }
+  }
+}
+
+async function deleteUnavailableProxies(btn, failedIds) {
+  let idsToDelete = failedIds;
+  if (!Array.isArray(idsToDelete) || !idsToDelete.length) {
+    let proxies = [];
+    try {
+      const pData = await api('api/proxies');
+      proxies = pData.items || [];
+    } catch (e) {
+      return alert(t('获取代理列表失败: ') + (e.message || e));
+    }
+    const probeResults = window.lastProxyProbeResults || {};
+    idsToDelete = proxies.filter(p => {
+      const probe = probeResults[p.id];
+      if (probe) return !probe.ok;
+      return p.fail_count > 0;
+    }).map(p => p.id);
+  }
+
+  if (!idsToDelete.length) {
+    return flash(t('当前没有检测到不可用的代理节点'));
+  }
+
+  if (!failedIds) {
+    const ok = await modalConfirm({
+      title: t('清理不可用代理'),
+      desc: t(`检测到 ${idsToDelete.length} 个不可用代理（测速不可达或连接中断），确定全部删除？已绑定的账号将自动解除绑定并恢复为直连/自动选择出口。`),
+      confirmText: t('确认删除'),
+      danger: true,
+    });
+    if (!ok) return;
+  }
+
+  const origText = btn ? btn.innerText : '';
+  if (btn) { btn.disabled = true; btn.innerText = t('清理中...'); }
+  try {
+    const res = await api('api/proxies/clean-unavailable', {
+      method: 'POST',
+      body: JSON.stringify({ ids: idsToDelete })
+    });
+    if (res.error) throw new Error(res.error);
+    const n = res.deleted ?? idsToDelete.length;
+    if (window.lastProxyProbeResults) {
+      idsToDelete.forEach(id => { delete window.lastProxyProbeResults[id]; });
+    }
+    flash(t(`已成功清理 ${n} 个不可用代理`));
+    await refreshPage();
+  } catch (err) {
+    alert(t('清理代理失败: ') + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerText = origText; }
+  }
+}
+
+async function autoBindBestProxies(btn, accountIds) {
+  const isBatch = Array.isArray(accountIds) && accountIds.length > 0;
+  const promptMsg = isBatch
+    ? `确定要为选中的 ${accountIds.length} 个账号自动测试并绑定最优低延迟节点吗？系统将优先家宽/住宅节点并按延迟分配。`
+    : '确定要为所有账号自动测试并绑定最优低延迟节点吗？系统将自动检测全部代理并优先将家宽/住宅与最低延迟节点 1:1 分配给账号。';
+  if (!confirm(t(promptMsg))) return;
+
+  const origText = btn ? btn.innerText : '';
+  if (btn) { btn.disabled = true; btn.innerText = t('检测绑定中...'); }
+  try {
+    const body = isBatch ? { account_ids: accountIds } : {};
+    const res = await api('api/proxies/auto-bind', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+    if (res.error) throw new Error(res.error);
+    const r = res.result || {};
+    const boundN = r.bound_accounts || 0;
+    const healthyN = r.healthy_proxies || 0;
+    flash(`智能绑定成功：已分配 ${boundN} 个账号（可用节点数: ${healthyN}）`);
+    if (isBatch && typeof clearSelectedAccounts === 'function') clearSelectedAccounts();
+    await refreshPage();
+  } catch (err) {
+    alert(t('智能绑定失败: ') + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerText = origText; }
+  }
+}
+
+async function assignProxyAccounts(proxyId, proxyName) {
+  let accts = [];
+  try {
+    const data = await api('api/accounts');
+    accts = data.items || [];
+  } catch (e) {}
+
+  if (!accts.length) return flash(t('当前没有可用账号'));
+
+  const cbsHtml = accts.map(a => {
+    const checked = a.proxy_id === proxyId ? 'checked' : '';
+    const otherProxy = a.proxy_id && a.proxy_id !== proxyId ? ` (${t('原:')} #${a.proxy_id} ${escapeHtml(a.proxy_name || '')})` : '';
+    return `
+      <label style="display:flex;align-items:center;gap:8px;padding:6px 0;font-size:13px;cursor:pointer;border-bottom:1px solid var(--outline-soft)">
+        <input type="checkbox" class="proxy-assign-cb" value="${a.id}" ${checked} style="width:16px;height:16px;accent-color:var(--g-blue)">
+        <span><b>#${a.id}</b> ${escapeHtml(a.email || a.label || '账号')} <span class="muted" style="font-size:11px">${otherProxy}</span></span>
+      </label>
+    `;
+  }).join('');
+
+  const bodyHTML = `
+    <div style="max-height:280px;overflow-y:auto;padding-right:4px">
+      ${cbsHtml}
+    </div>
+    <div class="hint" style="margin-top:8px;font-size:12px;color:var(--muted)">${t('勾选的账号将绑定至此代理；取消勾选的账号将解除绑定（恢复为直连/自动选择出口）。')}</div>
+  `;
+
+  const ok = await buildModal({
+    title: t(`换绑账号 - 代理 #${proxyId} (${proxyName})`),
+    desc: t('选择绑定到此代理节点的账号列表：'),
+    bodyHTML,
+    submitText: t('保存绑定设置'),
+    onSubmit: async (overlay) => {
+      const checkedIds = Array.from(overlay.querySelectorAll('.proxy-assign-cb:checked')).map(cb => parseInt(cb.value, 10));
+      const uncheckedIds = Array.from(overlay.querySelectorAll('.proxy-assign-cb:not(:checked)')).map(cb => parseInt(cb.value, 10));
+
+      if (checkedIds.length > 0) {
+        const res = await api('api/accounts', {
+          method: 'PATCH',
+          body: JSON.stringify({ ids: checkedIds, proxy_id: proxyId })
+        });
+        if (res.error) return { error: res.error };
+      }
+      const toUnbind = accts.filter(a => a.proxy_id === proxyId && uncheckedIds.includes(a.id)).map(a => a.id);
+      if (toUnbind.length > 0) {
+        const res = await api('api/accounts', {
+          method: 'PATCH',
+          body: JSON.stringify({ ids: toUnbind, proxy_id: 0 })
+        });
+        if (res.error) return { error: res.error };
+      }
+      return true;
+    }
+  });
+
+  if (ok === true) {
+    flash(t('代理绑定账号设置已更新'));
+    await refreshPage();
+  }
 }
 
 async function delCookieAcct(id) {
@@ -1622,8 +2250,10 @@ let pageSeq = 0;
 
 // 点已经选中的导航项直接忽略：重新拉一遍数据、整块内容闪一下再画回原样，
 // 用户看到的只是抖动。要重新取数有「刷新」按钮，走 refreshPage()。
-async function switchPage(name, force = false) {
+async function switchPage(name, force = false, { preserveView = false } = {}) {
   if (!force && name === currentPage) return;
+  const preserveAccountView = preserveView && force && name === 'cookies';
+  if (!preserveAccountView) stopQuotaCountdown();
   const seq = ++pageSeq;
   currentPage = name;
 
@@ -1635,19 +2265,30 @@ async function switchPage(name, force = false) {
 
   // 旧内容先留着，超过 200ms 还没好才显示占位——快的时候完全不闪
   const slow = setTimeout(() => {
-    if (seq === pageSeq) main.innerHTML = '<div class="empty">加载中…</div>';
+    if (!preserveAccountView && seq === pageSeq) main.innerHTML = '<div class="empty">加载中…</div>';
   }, 200);
   let html;
   try {
     html = await pages[name]();
   } catch (e) {
     clearTimeout(slow);
+    // 额度已返回时保留当前表格与倒计时；401 的登录页面和后续导航不能被旧内容覆盖。
+    if (preserveAccountView && seq === pageSeq && currentPage === 'cookies' && main.isConnected) {
+      let message = main.querySelector('.account-sync-error');
+      if (!message) {
+        main.querySelector('.account-summary').insertAdjacentHTML('afterend', '<div class="account-sync-error" role="status"></div>');
+        message = main.querySelector('.account-sync-error');
+      }
+      message.textContent = t('账号列表和统计未同步；保留已返回额度，请再次刷新。');
+      return;
+    }
     if (seq === pageSeq) main.innerHTML = '<div class="empty">' + e.message + '</div>';
     return;
   }
   clearTimeout(slow);
   if (seq !== pageSeq) return;   // 期间又点了别的页，丢弃这次结果
   main.innerHTML = html;
+  if (name === 'cookies') startQuotaCountdown();
 
   if (name === 'dashboard') {
     await loadChart('24h');
@@ -1667,7 +2308,8 @@ async function switchPage(name, force = false) {
 }
 
 // 主动重新拉当前页的数据（「刷新」按钮、增删改之后回填）
-function refreshPage() { return switchPage(currentPage, true); }
+function refreshPage(options = {}) { return switchPage(currentPage, true, options); }
+function render() { return refreshPage(); }
 
 // 侧栏图标（Material Symbols 风格的简化路径，内联避免外部依赖）
 const ICONS = {
@@ -1683,11 +2325,11 @@ const NAV = [
   ['dashboard', '概览'],
   ['requests', '请求记录'],
   ['proxies', '代理池'],
-  ['cookies', 'Cookie 池'],
+  ['cookies', '账号池'],
   ['settings', '设置'],
 ];
 const PAGE_TITLES = {
-  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Cookie 池', settings: '设置',
+  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: '账号池', settings: '设置',
 };
 
 function toggleSidebar() {
@@ -1745,7 +2387,7 @@ async function loadSideStat() {
   try {
     const [root, ck, usage] = await Promise.all([
       fetch('../').then(r => r.json()).catch(() => null),
-      api('api/cookies').catch(() => null),
+      api('api/accounts').catch(() => null),
       api('api/usage').catch(() => null),
     ]);
     const dot = document.getElementById('healthDot');
@@ -1755,13 +2397,14 @@ async function loadSideStat() {
     box.innerHTML = [
       ['版本', root ? 'v' + root.version : '—'],
       ['模型', root ? root.models.length + (LANG === 'en' ? ' models' : ' 个') : '—'],
-      ['Cookie', ck && ck.items && ck.items.length ? ck.items.length + (LANG === 'en' ? ' accounts' : ' 个') : t('匿名')],
+      ['账号', ck && ck.items && ck.items.length ? ck.items.length + (LANG === 'en' ? ' accounts' : ' 个') : t('匿名')],
       ['IP slot', usage ? (usage.items || []).length + (LANG === 'en' ? ' slots' : ' 个') : '—'],
     ].map(([k, v]) => `<div class="sf-row"><span>${t(k)}</span><b>${v}</b></div>`).join('');
   } catch (e) { box.innerHTML = ''; }
 }
 
 function renderLogin() {
+  stopQuotaCountdown();
   document.getElementById('app').innerHTML = `
     <div class="login-box">
       <h1><span class="spark" style="width:20px;height:20px;background:var(--g-sweep);
@@ -1792,6 +2435,111 @@ async function doLogin() {
 // I18N_EN 词典替换成英文；切回中文时从 ZH_ORIG 里恢复原文。渲染逻辑一行不用改，
 // 只在最外面套一层翻译。插值文案（带数字/名字的）不精确匹配、保持中文，属可接受。
 const I18N_EN = {
+  '一键测试全部代理': 'Test All Proxies',
+  '智能最优绑定': 'Auto-Bind Best Proxies',
+  '测速检测中...': 'Testing...',
+  '检测绑定中...': 'Binding...',
+  '测试完成': 'Test completed',
+  '智能绑定成功': 'Auto-bind succeeded',
+  '智能绑定失败': 'Auto-bind failed',
+  '测试失败: ': 'Test failed: ',
+  '不可用': 'Unavailable',
+  '确定要为所有账号自动测试并绑定最优低延迟节点吗？系统将自动检测全部代理并优先将家宽/住宅与最低延迟节点 1:1 分配给账号。': 'Auto-test all proxies and bind the lowest latency / residential nodes 1:1 to accounts?',
+  '一键全开': 'Enable All',
+  '一键全关': 'Disable All',
+  '批量启用': 'Batch Enable',
+  '批量关闭': 'Batch Disable',
+  '取消选择': 'Deselect',
+  '全选 / 取消全选': 'Select All / Deselect All',
+  '未选择任何账号': 'No accounts selected',
+  '确定启用账号池中的所有账号？': 'Are you sure you want to enable all accounts in the pool?',
+  '确定禁用账号池中的所有账号？禁用后请求将无法通过账号池分发。': 'Are you sure you want to disable all accounts in the pool? Requests cannot be distributed through the account pool when all are disabled.',
+  '全部启用': 'Enable All',
+  '全部禁用': 'Disable All',
+  '一键刷新': 'Refresh Page',
+  '一键刷新额度': 'Refresh All Quotas',
+  '换绑代理': 'Change Proxy',
+  '换绑账号': 'Change Accounts',
+  '绑定账号': 'Bound Accounts',
+  '暂无可刷新的账号': 'No accounts to refresh',
+  '刷新中…': 'Refreshing…',
+  '选择代理节点': 'Select Proxy Node',
+  '直连 / 自动选择出口': 'Direct / Auto Egress',
+  '确定换绑': 'Confirm Change',
+  '设置后该账号请求将固定走此代理出口。选择「直连 / 自动选择出口」则根据系统规则调度。': 'Requests for this account will route via this proxy. Selecting Direct / Auto follows scheduling rules.',
+  '代理绑定已更新': 'Proxy binding updated',
+  '选择目标代理节点': 'Select Target Proxy Node',
+  '批量换绑代理': 'Batch Change Proxies',
+  '确认批量换绑': 'Confirm Batch Change',
+  '批量更换代理完成': 'Batch proxy change completed',
+  '清理不可用代理': 'Clean Unavailable Proxies',
+  '一键导入 Clash 节点池': 'Import Clash Node Pool',
+  '一键导入 Clash 多端口节点池': 'Import Clash Multi-Port Node Pool',
+  '确认导入': 'Confirm Import',
+  '导入中...': 'Importing...',
+  '清理中...': 'Cleaning...',
+  '当前没有检测到不可用的代理节点': 'No unavailable proxy nodes found',
+  '确认删除': 'Confirm Delete',
+  '当前没有可用账号': 'No accounts available',
+  '选择绑定到此代理节点的账号列表：': 'Select accounts to bind to this proxy node:',
+  '勾选的账号将绑定至此代理；取消勾选的账号将解除绑定（恢复为直连/自动选择出口）。': 'Checked accounts will bind to this proxy; unchecked accounts will unbind (revert to Direct / Auto).',
+  '保存绑定设置': 'Save Bindings',
+  '代理绑定账号设置已更新': 'Proxy account bindings updated',
+  '原:': 'orig:',
+  '账号列表和统计未同步；保留已返回额度，请再次刷新。': 'Account list and statistics are not synchronized; returned quota retained. Refresh again to retry.',
+  '登录就绪': 'Login ready',
+  '可选号': 'Pool ready',
+  '已限额': 'Quota limited',
+  '网页额度（已用 / 剩余）': 'Web quota (used / remaining)',
+  '额度状态 / 恢复确认': 'Quota status / recovery confirmation',
+  '5小时已用': '5-hour used',
+  '周额度已用': 'Weekly used',
+  '剩余': 'Remaining',
+  '网页重置': 'Web reset',
+  '本机时间': 'Local time',
+  '未知': 'Unknown',
+  '上次或局部数据；读取未完成': 'Previous or partial data; read incomplete',
+  '上次数据；本次读取失败': 'Previous data; this read failed',
+  'Cookie 账号：网页额度未知': 'Cookie account: web quota unknown',
+  '额度可用': 'Quota available',
+  '额度未知，按账号原资格': 'Quota unknown; original account eligibility applies',
+  '5小时额度已耗尽': '5-hour quota exhausted',
+  '周额度已耗尽': 'Weekly quota exhausted',
+  '两窗口额度已耗尽': 'Both quota windows exhausted',
+  '当前不可选号': 'Currently ineligible',
+  '恢复确认时间': 'Recovery confirmation time',
+  '恢复时间未知，等待网页确认': 'Recovery time unknown; waiting for web confirmation',
+  '已到期，等待网页确认': 'Expired; waiting for web confirmation',
+  '到时仍需网页确认': 'Web confirmation still required at expiry',
+  '最近检查': 'Last check',
+  '读取错误': 'Read error',
+  '刷新额度': 'Refresh quota',
+  '额度读取中…': 'Reading quota…',
+  '额度已更新': 'Quota updated',
+  '额度读取未完成': 'Quota read incomplete',
+  '额度刷新失败；保留上次状态': 'Quota refresh failed; previous state retained',
+  '额度信息未完整识别': 'Quota information not fully recognized',
+  '用量读取已取消': 'Quota read cancelled',
+  '用量读取超时': 'Quota read timed out',
+  '账号登录失效，请重新登录': 'Account login expired; please log in again',
+  '无法确认网页用量，请稍后重试': 'Unable to confirm web quota; try again later',
+  '账号没有浏览器档案，无法读取用量': 'No browser profile; cannot read web quota',
+  '账号尚未确认登录，无法读取用量': 'Login not confirmed; cannot read web quota',
+  '固定账号已限额；当前选择保留，请等待网页确认恢复或手动切换。': 'Fixed account is quota limited; selection retained. Wait for web recovery confirmation or switch manually.',
+  '天': 'days',
+  '使用此账号': 'Use this account',
+  '当前使用': 'Currently selected',
+  '自动选号中': 'Automatic selection',
+  '切换为自动选号': 'Switch to automatic selection',
+  '重新登录': 'Log in again',
+  '完成登录': 'Confirm login',
+  '已登录': 'Logged in',
+  '需登录': 'Login required',
+  '等待登录确认': 'Waiting for login confirmation',
+  '打开窗口': 'Open browser window',
+  '独立档案': 'Separate profile',
+  'Cookie 导入': 'Cookie import',
+  '登录状态': 'Login status',
   '名称 *': 'Name *',
   '代理 URL *': 'Proxy URL *',
   '未知错误': 'Unknown error',
@@ -1834,6 +2582,7 @@ const I18N_EN = {
   '请求记录': 'Requests',
   '代理池': 'Proxy Pool',
   'Cookie 池': 'Cookie Pool',
+  '账号池': 'Account Pool',
   '设置': 'Settings',
   '运行中': 'Running',
   '无法连接': 'Disconnected',
@@ -2179,6 +2928,23 @@ const I18N_HTML_EN = {
 };
 
 const I18N_PATTERNS = [
+  [/^测试完成：(\d+)\/(\d+) 个节点满足 Gemini 限制且可用$/, 'Test completed: $1/$2 node(s) Gemini compliant and usable'],
+  [/^已成功清理 (\d+) 个不可用代理$/, 'Successfully cleaned up $1 unavailable proxy(ies)'],
+  [/^测试完成：检测到 (\d+) 个不可用节点，是否立即清理删除？$/, 'Test completed: $1 unavailable node(s) detected. Clean up and delete them now?'],
+  [/^智能绑定成功：已分配 (\d+) 个账号（可用节点数: (\d+)）$/, 'Auto-bind succeeded: assigned $1 account(s) (usable nodes: $2)'],
+  [/^确定要为选中的\s*(\d+)\s*个账号自动测试并绑定最优低延迟节点吗？系统将优先家宽\/住宅节点并按延迟分配。$/, 'Auto-test and bind lowest latency nodes to $1 selected account(s)? Residential nodes are prioritized.'],
+  [/^确定批量启用选中的\s*(\d+)\s*个账号？$/, 'Are you sure you want to enable $1 selected account(s)?'],
+  [/^确定批量关闭选中的\s*(\d+)\s*个账号？$/, 'Are you sure you want to disable $1 selected account(s)?'],
+  [/^已选择\s*(\d+)\s*个账号$/, 'Selected $1 account(s)'],
+  [/^已更新，当前启用\s*(\d+)\/(\d+)$/, 'Updated, currently active $1/$2'],
+  [/^全部账号已更新：当前启用\s*(\d+)\/(\d+)$/, 'All accounts updated: $1/$2 active'],
+  [/^刷新中\s*\((\d+)\/(\d+)\)$/, 'Refreshing ($1/$2)'],
+  [/^一键刷新额度完成，已检查\s*(\d+)\s*个账号$/, 'Refresh quotas complete, checked $1 account(s)'],
+  [/^换绑代理\s*-\s*账号\s*#(\d+)$/, 'Change Proxy - Account #$1'],
+  [/^为账号\s*(.+)\s*指定专用代理出口$/, 'Assign dedicated proxy egress for account $1'],
+  [/^将为选中的\s*(\d+)\s*个账号统一更换\/绑定为此代理节点。$/, 'Selected $1 account(s) will be bound to this proxy.'],
+  [/^确定批量为选中的\s*(\d+)\s*个账号更换绑定的代理？$/, 'Are you sure you want to change proxies for $1 selected account(s)?'],
+  [/^换绑账号\s*-\s*代理\s*#(\d+)\s*\((.+)\)$/, 'Change Accounts - Proxy #$1 ($2)'],
   [/^upstream error:\s*(.*)$/i, (m, p1) => 'Upstream error: ' + t(p1)],
   [/cookie\s*池里\s*(\d+)\s*个账号都不可用[（(]最后一个[：:](.*?)[）)]；到面板[「"']Cookie\s*池[」"']用[「"']检测[」"']按钮逐个排查，或打开\s*fallback_anon\s*降级匿名/g,
    (m, n, last) => `all ${n} account(s) in cookie pool unavailable (last: ${t(last)}); check accounts in "Cookie pool" with "Check" button, or enable fallback_anon to fall back to anonymous`],
@@ -2217,6 +2983,9 @@ const I18N_PATTERNS = [
   [/"content":"你好"/g, '"content":"Hello"'],
   [/^(\d[\d,.]*)\s*成功\s*·\s*(\d[\d,.]*)\s*失败$/, '$1 success · $2 failed'],
   [/^(\d+)\s*启用\s*\/\s*(\d+)\s*共$/, '$1 enabled / $2 total'],
+  [/^(\d+)\s*登录就绪$/, '$1 Login ready'],
+  [/^(\d+)\s*可选号$/, '$1 Pool ready'],
+  [/^(\d+)\s*已限额$/, '$1 Quota limited'],
   [/^(\d+-\d+)\s*\/\s*共\s*(\d+)\s*条$/, '$1 / $2 total'],
   [/^第\s*(\d+)\s*\/\s*(\d+)\s*页$/, 'Page $1 of $2'],
   [/^错误分类（近\s*(\d+)h）$/, 'Error breakdown (last $1h)'],
@@ -2414,6 +3183,7 @@ function toggleLang() {
   try { localStorage.setItem('lang', LANG); } catch (e) {}
   i18nApply();
   updateLangBtn();
+  if (currentPage === 'cookies') refreshPage();
   if (currentPage === 'dashboard') {
     const range = document.getElementById('rangeSel')?.value || '24h';
     loadChart(range);

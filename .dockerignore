@@ -1,0 +1,24 @@
+# 构建只需要源码，排除本机状态与依赖缓存。
+.git
+.github
+.codex
+.agents
+.gemini
+data
+node_modules
+**/node_modules
+packages
+docs/local
+config.json
+cookie.txt
+.env
+.env.*
+*.exe
+*.exe~
+*.db
+*.db-*
+*.log
+err.txt
+run_err.txt
+run_out.txt
+verification.md

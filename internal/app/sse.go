@@ -1,10 +1,36 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
+
+// 客户端取消后中断实际网络写；清理等待截止回调完成，防止响应返回后操作 writer。
+func cancelHTTPWrites(ctx context.Context, w http.ResponseWriter) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+		close(done)
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
+}
+
+type httpWriteCancellationKey struct{}
+
+// 子传输取消需要终止同一个 HTTP 写；保留各子请求原有的超时作用范围。
+func withHTTPWriteCancellation(ctx context.Context, w http.ResponseWriter) (context.Context, func()) {
+	ctx = context.WithValue(ctx, httpWriteCancellationKey{}, func() {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+	})
+	return ctx, cancelHTTPWrites(ctx, w)
+}
 
 // sseWriter 把 chat.completion.chunk 按 OpenAI 规范的顺序写出去：
 // 先 delta{role} → 若干 delta{content} → delta{} + finish_reason → 可选 usage → [DONE]。
@@ -133,7 +159,7 @@ func (s *sseWriter) Fail(err error) {
 		"id": s.id, "object": "chat.completion.chunk",
 		"created": s.created, "model": s.model,
 		"choices": []map[string]interface{}{},
-		"error":   map[string]string{"message": err.Error(), "type": "upstream_error"},
+		"error":   generationErrorBody(err),
 	}
 	b, _ := json.Marshal(c)
 	fmt.Fprintf(s.w, "data: %s\n\n", b)

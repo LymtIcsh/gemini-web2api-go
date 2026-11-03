@@ -172,16 +172,80 @@ func accountByID(id int64) *CookieAccount {
 
 // accountDelete 删除一条。
 func accountDelete(id int64) error {
-	_, err := getDB().Exec(`DELETE FROM accounts WHERE id=?`, id)
-	return err
+	tx, err := getDB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM browser_accounts WHERE account_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kv WHERE k=?`, quotaKey(id)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	pickMu.Lock()
+	if activeAccountID == id {
+		activeAccountID = 0
+	}
+	pickMu.Unlock()
+	if selectedAccountID() == id {
+		_ = setSelectedAccount(0)
+	}
+	return nil
 }
 
 // accountSetStatus 改状态（enabled / disabled）。
 func accountSetStatus(id int64, status string) error {
+	return accountSetStatusBatch([]int64{id}, status)
+}
+
+// accountSetStatusBatch 批量改状态（enabled / disabled）。ids 为空时影响全部账号。
+func accountSetStatusBatch(ids []int64, status string) error {
 	if status != "enabled" && status != "disabled" {
 		return fmt.Errorf("非法状态 %q", status)
 	}
-	_, err := getDB().Exec(`UPDATE accounts SET status=? WHERE id=?`, status, id)
+	if status == "disabled" {
+		pickMu.Lock()
+		activeAccountID = 0
+		pickMu.Unlock()
+	}
+	if len(ids) == 0 {
+		_, err := getDB().Exec(`UPDATE accounts SET status=?`, status)
+		return err
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids)+1)
+	args[0] = status
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i+1] = id
+	}
+	query := fmt.Sprintf(`UPDATE accounts SET status=? WHERE id IN (%s)`, strings.Join(placeholders, ","))
+	_, err := getDB().Exec(query, args...)
+	return err
+}
+
+// accountSetProxyBatch 批量改出口（proxyID=0 为直连/自动）。ids 为空时影响全部账号。
+func accountSetProxyBatch(ids []int64, proxyID int64) error {
+	if len(ids) == 0 {
+		_, err := getDB().Exec(`UPDATE accounts SET proxy_id=?`, proxyID)
+		return err
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids)+1)
+	args[0] = proxyID
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i+1] = id
+	}
+	query := fmt.Sprintf(`UPDATE accounts SET proxy_id=? WHERE id IN (%s)`, strings.Join(placeholders, ","))
+	_, err := getDB().Exec(query, args...)
 	return err
 }
 
@@ -395,10 +459,14 @@ func poolHasCookie(cookie string) bool {
 // 轮转调度、代理池都是进程内状态，这个反代天生单实例，不存在跨进程并发挑号；也就
 // 不必为此上跨方言的事务/行锁（sqlite 无 FOR UPDATE、mysql 无 RETURNING，那条路
 // 全是方言分支）。挑号只是一次极快的 SELECT+UPDATE，串行化的争用可忽略。
-var pickMu sync.Mutex
+var (
+	pickMu          sync.Mutex
+	activeAccountID int64
+)
 
-// pickCookieAccount 从池里挑一个 enabled 账号，按 last_used_at 最久优先，
-// 挑中后立刻把 last_used_at 记为现在（下次轮到别人）。池空返回 (nil,false)。
+// pickCookieAccount 从池里挑一个 enabled 账号。
+// 当策略为 sticky 时优先沿用当前活跃健康账号；当策略为 round_robin 时按 last_used_at 最久优先。
+// 池空返回 (nil,false)。
 func pickCookieAccount() (*CookieAccount, bool) {
 	return pickCookieAccountExcept(nil)
 }
@@ -411,6 +479,21 @@ func pickCookieAccount() (*CookieAccount, bool) {
 func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	pickMu.Lock()
 	defer pickMu.Unlock()
+
+	strategy := rtCfg().AccountStrategy
+	if strategy == "" {
+		strategy = "sticky"
+	}
+
+	// 粘性优先：如果当前活跃账号健康且仍有额度，且不在排除名单中，继续复用该账号
+	if strategy == "sticky" && activeAccountID > 0 && !skip[activeAccountID] {
+		a := accountByID(activeAccountID)
+		if a != nil && a.Status == "enabled" && a.FailCount == 0 && accountReady(a) && quotaEligible(a.ID) {
+			_, _ = getDB().Exec(`UPDATE accounts SET last_used_at=? WHERE id=?`, time.Now().Unix(), a.ID)
+			return a, true
+		}
+	}
+
 	// 健康的排前面，同样健康的按最久未用轮转。
 	//
 	// 不这么排的话坏号会跟好号平起平坐地轮到，而挑到坏号时它没有绑定的出口，
@@ -422,7 +505,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	if err != nil {
 		return nil, false
 	}
-	defer rows.Close()
+	var candidates []CookieAccount
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
@@ -431,6 +514,16 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 		}
 		if skip[a.ID] {
 			continue
+		}
+		candidates = append(candidates, a)
+	}
+	_ = rows.Close()
+	for _, a := range candidates {
+		if !accountReady(&a) || !quotaEligible(a.ID) {
+			continue
+		}
+		if strategy == "sticky" {
+			activeAccountID = a.ID
 		}
 		_, _ = getDB().Exec(`UPDATE accounts SET last_used_at=? WHERE id=?`, time.Now().Unix(), a.ID)
 		return &a, true
@@ -474,6 +567,11 @@ func markAccountResult(id int64, ok bool, errStr string) {
 			time.Now().Unix(), id)
 		return
 	}
+	pickMu.Lock()
+	if activeAccountID == id {
+		activeAccountID = 0
+	}
+	pickMu.Unlock()
 	_, _ = getDB().Exec(
 		`UPDATE accounts SET fail_count=fail_count+1, last_error=? WHERE id=?`,
 		truncate(errStr, 200), id)
