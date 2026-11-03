@@ -212,4 +212,8 @@ Linux/macOS: `BROWSER_REAL_SMOKE=1 npm run smoke`. It uses temporary profiles an
 
 Based on [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go), with [Camoufox](https://github.com/daijro/camoufox) and [Playwright](https://playwright.dev/). Distributed under the [MIT License](LICENSE), retaining original copyright notices.
 
+## Community
+
+[LINUX DO](https://linux.do/) — We appreciate the community's platform for technical discussion and open-source sharing, and support its values of sincerity, friendliness, unity, and professionalism.
+
 Documentation edited on 2026-11-03 by Codex.

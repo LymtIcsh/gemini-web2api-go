@@ -218,4 +218,8 @@ start.bat/stop.bat  Windows 启停入口
 
 基于 [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)，浏览器部分使用 [Camoufox](https://github.com/daijro/camoufox) 与 [Playwright](https://playwright.dev/)。采用 [MIT License](LICENSE)，保留原有版权声明。
 
+## 友情链接
+
+[LINUX DO](https://linux.do/) — 感谢社区提供的技术交流与开源分享平台，认可并支持社区「真诚、友善、团结、专业」的理念。
+
 文档整理：2026-11-03 · Codex。
