@@ -29,37 +29,53 @@ OpenAI 兼容客户端 → Go API → Node + Camoufox → Gemini 网页端
 
 ## 快速开始
 
-### 1. 准备环境
+### Windows：双击启动
 
-安装 **Go 1.26.8 或兼容更新版本**、**Node.js ≥22.15（推荐 24 LTS）** 和 Git。机器需能访问 Gemini，网页登录需要桌面图形环境；远程服务器需要可操作的桌面会话。
+程序和依赖准备好后，日常使用只需：
 
-```bash
+1. 双击 **`start.bat`**。首次按提示设置至少 12 位管理密码，随后自动打开管理面板。
+2. 在面板中添加并登录**自己的 Google 账号**，确认登录后即可使用。
+3. 结束使用时双击 **`stop.bat`**。下次启动会保留本机配置和登录态。
+
+面板：**http://127.0.0.1:8083/admin**。API Base URL：**http://127.0.0.1:8083/v1**。
+
+仓库不包含作者的账号池数据、Cookie、浏览器登录态、API Key 或本机 `config.json`。首次运行生成自己的配置，账号需要自行添加。
+
+<details>
+<summary>第一次从 GitHub 下载源码？展开完成一次性准备</summary>
+
+当前仓库提供源码，`start.bat` 不会自动编译或安装依赖。已准备好程序及依赖的用户可跳过本节。
+
+安装 **Go 1.26.8 或兼容更新版本**、**Node.js ≥22.15** 和 Git。机器需能访问 Gemini，并具有可操作的桌面环境。
+
+在 PowerShell 中执行：
+
+```powershell
 git clone https://github.com/LymtIcsh/gemini-web2api-go.git
 cd gemini-web2api-go
 cd browser-worker
 npm ci
 npx camoufox fetch
 cd ..
-```
-
-`npm ci` 使用锁文件安装依赖，`camoufox fetch` 另行下载浏览器。Node 必须在 PATH 中；Go 自动启动工作进程，无需手动运行 worker。
-
-### 2. 构建并启动
-
-**Windows / PowerShell：**
-
-```powershell
 go build -trimpath -o gemini-web2api-go.exe .
-.\start.bat
 ```
 
-首次设置至少 12 位管理密码，启动器生成本机 `config.json` 并打开面板。已有配置继续使用，运行 `stop.bat` 停止服务。不打开面板时：
+完成后双击根目录的 `start.bat`。请将生成的 EXE、`start.bat`、`stop.bat`、`launcher.ps1` 和 `browser-worker/` 保持在同一项目目录，Node 保持在 PATH 中。
+
+启动器自动创建本机 `config.json`，已有配置不会覆盖；Go 服务自动启动浏览器工作进程。
+
+</details>
+
+<details>
+<summary>Linux / macOS 与其他启动方式</summary>
+
+Windows 启动时不自动打开面板：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\launcher.ps1 -Action Start -NoBrowser
 ```
 
-**Linux / macOS：**
+Linux / macOS 安装上述 Go、Node 依赖及 Camoufox 后执行；网页登录需要桌面环境：
 
 ```bash
 go build -trimpath -o gemini-web2api-go .
@@ -68,11 +84,11 @@ cp config.example.json config.json
 ./gemini-web2api-go --config ./config.json
 ```
 
-面板：**http://127.0.0.1:8083/admin**。API Base URL：**http://127.0.0.1:8083/v1**。
-
 示例配置监听 `0.0.0.0`，仅本机使用请改为 `127.0.0.1`。Windows 首次配置默认模型为 `gemini-4-argon`，示例配置为 `gemini-3.6-flash`；请按账号权限在面板调整或在请求中指定模型。
 
-### 3. 登录账号并接入客户端
+</details>
+
+### 登录账号并接入客户端
 
 1. 打开面板，输入管理密码。
 2. 在「账号池」添加账号，打开登录窗口，完成 Google 登录。

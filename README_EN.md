@@ -29,37 +29,53 @@ Browser accounts send requests through real browser pages. Cookie-only and anony
 
 ## Quick start
 
-### 1. Prepare the environment
+### Windows: double-click to start
 
-Install **Go 1.26.8 or a compatible newer version**, **Node.js ≥22.15 (24 LTS recommended)**, and Git. The machine must reach Gemini. Interactive login needs a graphical desktop session, including on remote hosts.
+Once the executable and dependencies are ready, everyday use is simple:
 
-```bash
+1. Double-click **`start.bat`**. On first launch, set an admin password of at least 12 characters. The dashboard opens automatically.
+2. Add and sign in to **your own Google account** in the dashboard, then confirm login.
+3. Double-click **`stop.bat`** to stop. Your local configuration and login state are preserved for the next launch.
+
+Dashboard: **http://127.0.0.1:8083/admin**. API Base URL: **http://127.0.0.1:8083/v1**.
+
+This repository does not include the author's account data, cookies, browser sessions, API keys, or local `config.json`. First launch creates your own configuration; add your own accounts.
+
+<details>
+<summary>First time downloading the source from GitHub? Expand for one-time setup</summary>
+
+The repository contains source code. `start.bat` does not compile the executable or install dependencies. Skip this section if both are already prepared.
+
+Install **Go 1.26.8 or a compatible newer version**, **Node.js ≥22.15**, and Git. The machine must reach Gemini and provide an interactive desktop session.
+
+Run in PowerShell:
+
+```powershell
 git clone https://github.com/LymtIcsh/gemini-web2api-go.git
 cd gemini-web2api-go
 cd browser-worker
 npm ci
 npx camoufox fetch
 cd ..
-```
-
-The lockfile pins dependencies; Camoufox downloads the browser separately. Keep Node on PATH. The Go service starts the worker automatically.
-
-### 2. Build and run
-
-**Windows / PowerShell:**
-
-```powershell
 go build -trimpath -o gemini-web2api-go.exe .
-.\start.bat
 ```
 
-First launch requests an admin password of at least 12 characters, creates local `config.json`, and opens the dashboard. Existing configuration is preserved. Use `stop.bat` to stop this directory's service. To start without opening the dashboard:
+Then double-click `start.bat` in the project root. Keep the executable, `start.bat`, `stop.bat`, `launcher.ps1`, and `browser-worker/` together in the project directory, with Node on PATH.
+
+The launcher creates local `config.json` without overwriting existing settings. The Go service starts the browser worker automatically.
+
+</details>
+
+<details>
+<summary>Linux / macOS and other startup options</summary>
+
+On Windows, to start without opening the dashboard:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\launcher.ps1 -Action Start -NoBrowser
 ```
 
-**Linux / macOS:**
+On Linux / macOS, install the Go and Node dependencies and Camoufox described above, then run the following. Interactive login requires a desktop session.
 
 ```bash
 go build -trimpath -o gemini-web2api-go .
@@ -68,11 +84,11 @@ cp config.example.json config.json
 ./gemini-web2api-go --config ./config.json
 ```
 
-Dashboard: **http://127.0.0.1:8083/admin**. API Base URL: **http://127.0.0.1:8083/v1**.
-
 The example listens on `0.0.0.0`; use `127.0.0.1` for local-only access. The Windows launcher initially selects `gemini-4-argon`, while the example uses `gemini-3.6-flash`. Select an entitled model in the dashboard or specify one in requests.
 
-### 3. Sign in and connect a client
+</details>
+
+### Sign in and connect a client
 
 1. Open the dashboard and enter the admin password.
 2. Add an account and complete Google login in its browser window.
